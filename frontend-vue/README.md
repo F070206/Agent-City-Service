@@ -1,6 +1,6 @@
-﻿# hm-dianping-vue
+﻿# 同城生活服务平台前端
 
-基于 `Vue3 + Vite + Element Plus + Axios + Pinia` 的黑马点评前端示例项目。
+基于 `Vue3 + Vite + Element Plus + Axios + Pinia` 的同城生活服务平台前端示例项目。
 
 ## 启动
 

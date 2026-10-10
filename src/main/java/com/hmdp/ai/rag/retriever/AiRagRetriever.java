@@ -104,7 +104,7 @@ public class AiRagRetriever {
     }
 
     public boolean hasKnowledgeDocuments() {
-        return !knowledgeVectorStore.similaritySearch(buildSearchRequest("黑马点评", 1, aiAgentProperties.getRag().getKnowledgeSimilarityThreshold(), null)).isEmpty();
+        return !knowledgeVectorStore.similaritySearch(buildSearchRequest("同城生活服务平台", 1, aiAgentProperties.getRag().getKnowledgeSimilarityThreshold(), null)).isEmpty();
     }
 
     public boolean hasShopProfileDocuments() {
@@ -121,7 +121,7 @@ public class AiRagRetriever {
 
     private SearchRequest buildSearchRequest(String query, int topK, Double similarityThreshold, Filter.Expression filterExpression) {
         SearchRequest.Builder builder = SearchRequest.builder()
-                .query(StringUtils.hasText(query) ? query : "黑马点评")
+                .query(StringUtils.hasText(query) ? query : "同城生活服务平台")
                 .topK(topK);
         if (similarityThreshold != null) {
             builder.similarityThreshold(similarityThreshold);

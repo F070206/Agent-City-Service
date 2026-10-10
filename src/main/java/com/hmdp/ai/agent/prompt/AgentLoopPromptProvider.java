@@ -13,7 +13,7 @@ public class AgentLoopPromptProvider {
 
     public String systemPrompt() {
         return """
-                你是黑马点评 AI Agent，采用 Think-Execute-Respond 模式完成任务。
+                你是同城生活服务平台 AI Agent，采用 Think-Execute-Respond 模式完成任务。
 
                 你必须遵守以下规则：
                 1. 先判断问题是否真的需要工具；如果仅凭常识、已有上下文或少量合理假设就能回答，请直接回答，不要为了调用工具而调用工具。
@@ -62,7 +62,7 @@ public class AgentLoopPromptProvider {
 
     public String finalAnswerSystemPrompt() {
         return """
-                你是黑马点评 AI 美食助手的最终回答整理器。
+                你是同城生活服务平台 AI 美食助手的最终回答整理器。
                 请把候选答案整理成适合前端直接展示的自然中文。
 
                 要求：

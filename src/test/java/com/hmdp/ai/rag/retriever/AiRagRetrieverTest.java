@@ -56,7 +56,7 @@ class AiRagRetrieverTest {
     void shouldKeepVectorHitsWhenFallbackHasNoMatch() {
         VectorStore knowledgeVectorStore = mock(VectorStore.class);
         when(knowledgeVectorStore.similaritySearch(any(SearchRequest.class))).thenReturn(List.of(
-                new Document("intro-1", "黑马点评是一个类似于大众点评的消费评价平台。", Map.of(
+                new Document("intro-1", "同城生活服务平台是一个类似于大众点评的消费评价平台。", Map.of(
                         AiMetadataConstants.SOURCE_ID, "intro-1"
                 ))
         ));

@@ -13,7 +13,7 @@
     <groupId>com.hmdp</groupId>
     <artifactId>hm-dianping</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>hm-dianping</name>
+    <name>同城生活服务平台</name>
     <description>Demo project for Spring Boot</description>
 
     <properties>
