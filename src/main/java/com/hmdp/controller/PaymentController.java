@@ -91,7 +91,10 @@ public class PaymentController {
             return Result.fail("订单状态不正确");
         }
 
-        paymentService.createPayment(orderId, payType);
+        Result payment = paymentService.createPayment(orderId, payType);
+        if (!Boolean.TRUE.equals(payment.getSuccess())) {
+            return payment;
+        }
 
         Map<String, Object> result = new HashMap<>();
         result.put("orderId", orderId);

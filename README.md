@@ -47,7 +47,7 @@ CityAI Hub 是一个类“大众点评”的本地生活服务平台，在店铺
 - 逻辑过期与互斥重建缓解热点 Key 击穿
 - Redis ZSet + Lua + AOP 实现滑动窗口限流
 - Redis Lua 保证秒杀资格校验与库存预扣的原子性
-- Redisson/Redis 分布式锁保护订单状态并发更新
+- 数据库条件更新保护订单状态并发迁移，持久化补偿任务同步关单库存
 
 ## 技术栈
 
@@ -140,6 +140,7 @@ cd Agent-City-Service
 ```text
 src/main/resources/db/hmdp.sql
 src/main/resources/db/ai-agent.sql
+src/main/resources/db/order-stock-sync.sql
 ```
 
 ### 3. 启动基础服务
@@ -229,9 +230,22 @@ AI_AGENT_MCP_WEATHER_API_KEY=<weather-service-key>
 
 ## 关键设计
 
+### 订单 ID
+
+普通券和秒杀订单统一通过 `SnowflakeIdWorker` 生成 ID，复用已有 MyBatis-Plus 的 `Sequence` 雪花算法，无需新增依赖，也不再访问 Redis 的 `icr:order:*` 计数器。ID 由毫秒时间戳、数据中心编号、机器编号和序列号组成，仍使用 `Long` / 数据库 `BIGINT`，接口继续以字符串返回，已有订单 ID 不做修改。
+
+- 单实例本地运行默认使用数据中心 `0`、机器 `0`。
+- 多实例部署时，通过 `SNOWFLAKE_DATACENTER_ID` 和 `SNOWFLAKE_WORKER_ID` 设置编号，两个值均为 `0~31`，所有发号实例的编号组合必须不同；这两个环境变量只控制本项目的订单生成器。不要在滚动发布中让新旧实例同时复用同一组合。
+- 使用 MyBatis-Plus 自带的运行期时钟回拨保护：小幅回拨等待后重试，较大回拨或时间未恢复时抛出异常。重启不会保留上次发号时间，需保持系统时钟同步，避免时钟回拨后立即复用节点编号。
+- 订单库存、登录态等功能仍然使用 Redis；这里只替换 ID 生成逻辑，不改变数据库自增主键和其他 UUID 的用途。
+
 ### 秒杀与订单
 
-秒杀请求先通过 Redis Lua 原子校验库存与一人一单资格，预扣成功后将下单任务发送到 RocketMQ，由消费者异步写入数据库。订单创建后发送延迟消息；到期仍未支付时自动关闭订单并回滚库存。支付与超时关单竞争同一订单状态时，通过分布式锁和状态校验避免重复处理。
+秒杀请求先通过 Redis Lua 原子校验库存与一人一单资格，预扣成功后将下单任务发送到 RocketMQ，由消费者异步写入数据库。订单创建后发送延迟消息；到期仍未支付时自动关闭订单并回滚库存。支付与超时关单通过数据库 `WHERE status = 1` 条件更新竞争同一订单状态，避免旧快照覆盖终态；支付状态直接查询数据库。
+
+关单、数据库库存回补和 `tb_order_stock_sync` 补偿任务在同一事务内提交。后台默认每 5 秒扫描到期任务（`order.stock-sync.delay-ms` 可调整），通过 Lua 原子执行 Redis 库存回补、资格释放和订单幂等标记；失败记录重试次数并在 30 秒后重试，重启后可继续扫描。属于**数据库事务一致性 + Redis 可重试的最终一致性**，不是 MySQL 与 Redis 跨系统强一致性。已有数据库需在部署前执行新增的 `order-stock-sync.sql`，不能重新执行会删表的 `hmdp.sql`。
+
+Redis 回补标记不设 TTL，避免延迟重试释放同一用户的新订单；仅在确认任务及所有在途执行均已结束后，才能协调清理任务与标记。Redis 数据整体丢失、标记被淘汰及恢复期间需暂停活动并人工对账；已有订单或占用时不再按数据库库存自动补热。需监控未完成任务数量、最早创建时间及 `attempts`，持续失败不能仅靠重试消除。该改进覆盖支付与关单链路；秒杀入口的 MQ 发送不确定性、落单失败补偿和延迟消息投递失败仍需单独治理。
 
 ### 缓存治理
 
@@ -254,6 +268,16 @@ mvn test
 ```
 
 部分集成测试依赖正在运行的 MySQL、Redis、RocketMQ、Milvus 或模型服务。若本地没有启动对应依赖，请按测试范围单独执行。
+
+支付与关单回归测试可单独运行：
+
+```bash
+mvn -Dtest=PaymentServiceImplTest,PaymentControllerTest,OrderStockSyncWorkerTest,SeckillStockWarmupTest,VoucherOrderIdTest test
+```
+
+真实 MySQL 验证使用 `PaymentConsistencyIntegrationTest`：设置 `PAYMENT_TEST_MYSQL_HOST`，以及可选的 `PAYMENT_TEST_MYSQL_PORT`、`PAYMENT_TEST_MYSQL_USER`、`PAYMENT_TEST_MYSQL_PASSWORD`。测试自动创建并删除 `payment_consistency_test_<UUID>` 独立数据库，需要该测试账号具备建库权限，不访问现有业务表。覆盖事务回滚、提交可见性、重复关单和 20 轮并发竞争。原始秒杀表 DDL 的零日期默认值仅在临时测试表中替换为当前时间，以兼容严格 SQL 模式。
+
+真实 Redis 验证使用 `OrderStockReleaseIntegrationTest`：设置 `PAYMENT_TEST_REDIS_HOST`，以及可选的 `PAYMENT_TEST_REDIS_PORT`、`PAYMENT_TEST_REDIS_PASSWORD`。建议使用独立 Redis；测试仅操作 `test:payment:<UUID>:` 前缀，覆盖 32 次并发回补、重复任务与再次抢购、缓存缺失及错误类型。未提供相应环境变量时，这两个外部集成测试默认不执行。
 
 ## 说明
 

@@ -1,11 +1,11 @@
 package com.hmdp.service.impl;
 
+import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.service.IPaymentService;
 import com.hmdp.service.IVoucherOrderService;
-import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -14,9 +14,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.time.LocalDateTime;
-import java.util.concurrent.TimeUnit;
 
-import static com.hmdp.utils.RedisConstants.ORDER_PAYMENT_LOCK_PREFIX;
 import static com.hmdp.utils.RedisConstants.SECKILL_ORDER_PENDING_KEY;
 
 @Slf4j
@@ -38,8 +36,14 @@ public class PaymentServiceImpl implements IPaymentService {
             return Result.fail("订单状态不正确");
         }
 
-        order.setPayType(payType);
-        voucherOrderService.updateById(order);
+        boolean updated = voucherOrderService.update(new UpdateWrapper<VoucherOrder>()
+                .eq("id", orderId)
+                .eq("status", VoucherOrder.STATUS_UNPAID)
+                .set("pay_type", payType)
+                .set("update_time", LocalDateTime.now()));
+        if (!updated) {
+            return Result.fail("订单状态已变更，请刷新后重试");
+        }
 
         log.info("创建支付订单：订单ID={}, 支付方式={}", orderId, payType);
         return Result.ok("支付订单创建成功");
@@ -63,15 +67,6 @@ public class PaymentServiceImpl implements IPaymentService {
     }
 
     private Result handlePaymentCallback(Long orderId) {
-        String lockKey = ORDER_PAYMENT_LOCK_PREFIX + orderId;
-        SimpleRedisLock lock = new SimpleRedisLock(lockKey, stringRedisTemplate);
-
-        boolean isLock = lock.tryLock(0, 5, TimeUnit.SECONDS);
-        if (!isLock) {
-            log.warn("获取订单支付锁失败，订单ID={}", orderId);
-            return Result.fail("订单处理中，请稍后重试");
-        }
-
         try {
             VoucherOrder order = voucherOrderService.getById(orderId);
             if (order == null) {
@@ -88,18 +83,27 @@ public class PaymentServiceImpl implements IPaymentService {
                 return Result.fail("订单状态不正确");
             }
 
-            order.setStatus(VoucherOrder.STATUS_PAID);
-            order.setPayTime(LocalDateTime.now());
-            order.setUpdateTime(LocalDateTime.now());
-            voucherOrderService.updateById(order);
+            // 与关单竞争同一数据库行，只有未支付状态能迁移，锁过期也不会覆盖终态。
+            LocalDateTime now = LocalDateTime.now();
+            boolean updated = voucherOrderService.update(new UpdateWrapper<VoucherOrder>()
+                    .eq("id", orderId)
+                    .eq("status", VoucherOrder.STATUS_UNPAID)
+                    .set("status", VoucherOrder.STATUS_PAID)
+                    .set("pay_time", now)
+                    .set("update_time", now));
+            if (!updated) {
+                VoucherOrder current = voucherOrderService.getById(orderId);
+                if (current != null && VoucherOrder.STATUS_PAID.equals(current.getStatus())) {
+                    return Result.ok("订单已支付");
+                }
+                return Result.fail("订单状态已变更，无法支付");
+            }
 
             log.info("订单支付成功，订单ID={}", orderId);
             return Result.ok("支付成功");
         } catch (Exception e) {
             log.error("支付回调处理异常，订单ID={}", orderId, e);
             return Result.fail("支付回调处理失败");
-        } finally {
-            lock.unlock();
         }
     }
 

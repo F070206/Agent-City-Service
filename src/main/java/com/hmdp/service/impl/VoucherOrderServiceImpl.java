@@ -1,5 +1,7 @@
 package com.hmdp.service.impl;
 
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -8,11 +10,12 @@ import com.hmdp.dto.Result;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.Voucher;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.mapper.OrderStockSyncMapper;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.service.IVoucherService;
-import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SnowflakeIdWorker;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
@@ -41,7 +44,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private static final int SECKILL_RESULT_STOCK_NOT_READY = 3;
 
     @Resource
-    private RedisIdWorker redisIdWorker;
+    private SnowflakeIdWorker snowflakeIdWorker;
     @Resource
     private StringRedisTemplate stringRedisTemplate;
     @Resource
@@ -52,6 +55,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private IVoucherService voucherService;
     @Resource
     private ObjectMapper objectMapper;
+    @Resource
+    private OrderStockSyncMapper orderStockSyncMapper;
 
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
 
@@ -73,7 +78,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return Result.fail("该优惠券为秒杀券，请使用秒杀方式购买");
         }
 
-        long orderId = redisIdWorker.nextId("order");
+        long orderId = snowflakeIdWorker.nextId();
         VoucherOrder order = new VoucherOrder();
         order.setId(orderId);
         order.setUserId(userId);
@@ -92,7 +97,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Override
     public Result seckillVoucher(Long voucherId) {
         Long userId = UserHolder.getUser().getId();
-        long orderId = redisIdWorker.nextId("order");
+        long orderId = snowflakeIdWorker.nextId();
 
         Long result = executeSeckillScript(voucherId, userId);
         if (result == null) {
@@ -103,8 +108,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         int r = result.intValue();
         if (r == SECKILL_RESULT_STOCK_NOT_READY) {
             if (!tryWarmupSeckillStock(voucherId)) {
-                log.warn("秒杀券不存在或未配置库存，voucherId={}", voucherId);
-                return Result.fail("该优惠券未配置秒杀活动或库存");
+                log.warn("秒杀库存不可用或需要对账恢复，voucherId={}", voucherId);
+                return Result.fail("秒杀库存暂不可用，请稍后重试");
             }
             result = executeSeckillScript(voucherId, userId);
             if (result == null) {
@@ -199,9 +204,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     public void closeTimeoutOrder(Long orderId) {
         VoucherOrder order = getById(orderId);
         if (order == null) {
-            log.warn("订单不存在，订单ID={}", orderId);
-            clearOrderPending(orderId);
-            return;
+            // 下单与关单分属不同队列，关单消息可能先于落库到达。
+            throw new IllegalStateException("订单尚未落库，等待重试，订单ID=" + orderId);
         }
 
         if (!VoucherOrder.STATUS_UNPAID.equals(order.getStatus())) {
@@ -209,10 +213,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return;
         }
 
-        order.setStatus(VoucherOrder.STATUS_CANCELLED);
-        order.setUpdateTime(LocalDateTime.now());
-        if (!updateById(order)) {
-            throw new IllegalStateException("关闭超时订单失败，订单ID=" + orderId);
+        boolean closed = update(new UpdateWrapper<VoucherOrder>()
+                .eq("id", orderId)
+                .eq("status", VoucherOrder.STATUS_UNPAID)
+                .set("status", VoucherOrder.STATUS_CANCELLED)
+                .set("update_time", LocalDateTime.now()));
+        if (!closed) {
+            return;
         }
 
         boolean stockUpdated = seckillVoucherService.update()
@@ -223,8 +230,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             throw new IllegalStateException("回滚秒杀库存失败，订单ID=" + orderId);
         }
 
-        rollbackSeckillReservation(order.getVoucherId(), order.getUserId());
-        clearOrderPending(orderId);
+        // 关单、数据库库存回补与同步任务在同一本地事务中提交。
+        // Redis 由后台任务在提交后幂等更新，失败不会丢失待办。
+        if (orderStockSyncMapper.insertTask(orderId, order.getVoucherId(), order.getUserId()) != 1) {
+            throw new IllegalStateException("保存库存同步任务失败，订单ID=" + orderId);
+        }
         log.info("订单超时已关闭，订单ID={}", orderId);
     }
 
@@ -237,11 +247,17 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
     private boolean tryWarmupSeckillStock(Long voucherId) {
+        // 已运行活动的 DB 库存可能已包含尚未同步的关单回补，不能直接覆盖 Redis。
+        if (count(new QueryWrapper<VoucherOrder>().eq("voucher_id", voucherId)) > 0
+                || Boolean.TRUE.equals(stringRedisTemplate.hasKey(SECKILL_ORDER_KEY_PREFIX + voucherId))) {
+            log.error("秒杀库存缺失且已有订单或占用，停止自动补热，请核对恢复，voucherId={}", voucherId);
+            return false;
+        }
         SeckillVoucher seckillVoucher = seckillVoucherService.getById(voucherId);
         if (seckillVoucher == null || seckillVoucher.getStock() == null) {
             return false;
         }
-        stringRedisTemplate.opsForValue().set(SECKILL_STOCK_KEY + voucherId, seckillVoucher.getStock().toString());
+        stringRedisTemplate.opsForValue().setIfAbsent(SECKILL_STOCK_KEY + voucherId, seckillVoucher.getStock().toString());
         log.info("检测到秒杀库存缺失，已按需补热到 Redis，voucherId={}, stock={}", voucherId, seckillVoucher.getStock());
         return true;
     }

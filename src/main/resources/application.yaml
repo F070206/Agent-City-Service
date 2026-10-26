@@ -55,6 +55,12 @@ rocketmq:
   producer:
     group: hmdp-producer-group
 
+id:
+  snowflake:
+    # 单实例默认 0/0；多实例部署必须分配不同的编号组合，两个编号均为 0~31。
+    worker-id: ${SNOWFLAKE_WORKER_ID:0}
+    datacenter-id: ${SNOWFLAKE_DATACENTER_ID:0}
+
 ai:
   agent:
     bootstrap:

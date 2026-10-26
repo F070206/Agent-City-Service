@@ -9,7 +9,7 @@ import com.hmdp.entity.User;
 import com.hmdp.service.impl.SeckillVoucherServiceImpl;
 import com.hmdp.service.impl.ShopServiceImpl;
 import com.hmdp.utils.CacheClient;
-import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SnowflakeIdWorker;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.geo.Point;
@@ -46,7 +46,7 @@ class HmDianPingApplicationTests {
     private SeckillVoucherServiceImpl seckillVoucherService;
 
     @Resource
-    private RedisIdWorker redisIdWorker;
+    private SnowflakeIdWorker snowflakeIdWorker;
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
@@ -101,7 +101,7 @@ class HmDianPingApplicationTests {
 
         Runnable task = () -> {
             for (int i = 0; i < 100; i++) {
-                long id = redisIdWorker.nextId("order");
+                long id = snowflakeIdWorker.nextId();
                 System.out.println("id = " + id);
             }
             latch.countDown();
