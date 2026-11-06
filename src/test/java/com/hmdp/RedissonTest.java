@@ -6,12 +6,14 @@ import org.junit.jupiter.api.Test;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import jakarta.annotation.Resource;
 import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @SpringBootTest
+@EnabledIfEnvironmentVariable(named = "CITYAI_RUN_LEGACY_INTEGRATION_TESTS", matches = "true")
 class RedissonTest {
 
     @Resource

@@ -24,6 +24,7 @@ public class MvcConfig implements WebMvcConfigurer {
                         "/index.html",
                         "/favicon.ico",
                         "/error",
+                        "/internal/**",
                         "/**/*.css",
                         "/**/*.js",
                         "/**/*.png",
@@ -34,7 +35,6 @@ public class MvcConfig implements WebMvcConfigurer {
                         "/shop/**",
                         "/voucher/**",
                         "/shop-type/**",
-                        "/upload/**",
                         "/blog/hot",
                         "/user/code",
                         "/user/login"

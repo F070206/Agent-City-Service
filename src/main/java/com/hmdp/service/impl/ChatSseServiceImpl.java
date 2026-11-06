@@ -4,6 +4,9 @@ import com.hmdp.dto.ChatStreamEvent;
 import com.hmdp.service.ChatSseService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
@@ -17,14 +20,19 @@ import java.util.concurrent.CopyOnWriteArrayList;
 @Service
 public class ChatSseServiceImpl implements ChatSseService {
 
-    private static final long NO_TIMEOUT = 0L;
+    private static final long SSE_TIMEOUT_MILLIS = 120_000L;
+
+    @Value("${ai.sse.max-connections-per-user:8}")
+    private int maxConnectionsPerUser = 8;
 
     private final ConcurrentHashMap<StreamKey, CopyOnWriteArrayList<SseEmitter>> emitters = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, java.util.Set<SseEmitter>> userEmitters = new ConcurrentHashMap<>();
 
     @Override
     public SseEmitter connect(Long userId, Long conversationId) {
         StreamKey key = new StreamKey(userId, conversationId);
-        SseEmitter emitter = new SseEmitter(NO_TIMEOUT);
+        SseEmitter emitter = new SseEmitter(SSE_TIMEOUT_MILLIS);
+        registerUserEmitter(userId, emitter);
         emitters.computeIfAbsent(key, ignored -> new CopyOnWriteArrayList<>()).add(emitter);
         emitter.onCompletion(() -> removeEmitter(key, emitter));
         emitter.onTimeout(() -> removeEmitter(key, emitter));
@@ -50,7 +58,7 @@ public class ChatSseServiceImpl implements ChatSseService {
                         .name(event.getType())
                         .data(event));
             }
-            catch (IOException e) {
+            catch (IOException | IllegalStateException e) {
                 log.debug("Failed to send SSE event, conversationId={}, type={}", conversationId, event.getType(), e);
                 removeEmitter(new StreamKey(userId, conversationId), emitter);
             }
@@ -59,13 +67,29 @@ public class ChatSseServiceImpl implements ChatSseService {
 
     private void removeEmitter(StreamKey key, SseEmitter emitter) {
         CopyOnWriteArrayList<SseEmitter> emitterList = emitters.get(key);
-        if (emitterList == null) {
-            return;
-        }
-        emitterList.remove(emitter);
-        if (emitterList.isEmpty()) {
+        boolean removed = emitterList != null && emitterList.remove(emitter);
+        if (emitterList != null && emitterList.isEmpty()) {
             emitters.remove(key, emitterList);
         }
+        if (removed) {
+            userEmitters.computeIfPresent(key.userId(), (userId, connections) -> {
+                connections.remove(emitter);
+                return connections.isEmpty() ? null : connections;
+            });
+        }
+    }
+
+    private void registerUserEmitter(Long userId, SseEmitter emitter) {
+        userEmitters.compute(userId, (ignored, connections) -> {
+            java.util.Set<SseEmitter> current = connections == null
+                    ? ConcurrentHashMap.newKeySet() : connections;
+            if (current.size() >= Math.max(maxConnectionsPerUser, 1)) {
+                throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS,
+                        "当前账号的 AI 流式连接数已达上限");
+            }
+            current.add(emitter);
+            return current;
+        });
     }
 
     private record StreamKey(Long userId, Long conversationId) {

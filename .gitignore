@@ -48,3 +48,7 @@ build/
 ### VS Code ###
 .vscode/
 /frontend-vue/.vite/
+/start.local.json
+
+# Frontend dependencies
+node_modules/

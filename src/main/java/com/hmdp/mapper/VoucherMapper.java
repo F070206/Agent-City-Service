@@ -1,5 +1,7 @@
 package com.hmdp.mapper;
 
+import com.hmdp.micro.MapperRole;
+
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.hmdp.entity.Voucher;
 import org.apache.ibatis.annotations.Param;
@@ -15,10 +17,10 @@ import java.util.List;
  * @author 虎哥
  * @since 2021-12-22
  */
+@MapperRole.Order
 public interface VoucherMapper extends BaseMapper<Voucher> {
-    //添加针对优惠券表的查询
-    @Select("SELECT id FROM tb_voucher LIMIT #{offset}, #{limit}")
-    List<Long> selectAllIds(@Param("offset") int offset, @Param("limit") int limit);
+    @Select("SELECT id FROM tb_voucher WHERE id > #{afterId} ORDER BY id LIMIT #{limit}")
+    List<Long> selectIdsAfter(@Param("afterId") long afterId, @Param("limit") int limit);
 
     List<Voucher> queryVoucherOfShop(@Param("shopId") Long shopId);
 }

@@ -15,6 +15,7 @@ import org.springframework.ai.document.Document;
 import org.springframework.ai.embedding.BatchingStrategy;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.SimpleVectorStore;
 import org.springframework.ai.vectorstore.milvus.MilvusVectorStore;
 import org.springframework.ai.vectorstore.milvus.autoconfigure.MilvusServiceClientProperties;
 import org.springframework.ai.vectorstore.milvus.autoconfigure.MilvusVectorStoreProperties;
@@ -22,6 +23,8 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.boot.web.client.RestClientCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.client.OkHttp3ClientHttpRequestFactory;
 import org.springframework.util.StringUtils;
 import okhttp3.OkHttpClient;
@@ -37,7 +40,11 @@ import java.util.concurrent.TimeUnit;
  */
 @Slf4j
 @Configuration
-@EnableConfigurationProperties(AiAgentProperties.class)
+@EnableConfigurationProperties({
+        AiAgentProperties.class,
+        MilvusServiceClientProperties.class,
+        MilvusVectorStoreProperties.class
+})
 public class CommonConfiguration {
 
     @Bean
@@ -61,14 +68,17 @@ public class CommonConfiguration {
     }
 
     @Bean
+    @Lazy
     public MilvusServiceClient milvusServiceClient(MilvusServiceClientProperties clientProperties,
-                                                   MilvusVectorStoreProperties vectorStoreProperties) {
+                                                   MilvusVectorStoreProperties vectorStoreProperties,
+                                                   AiAgentProperties aiAgentProperties) {
         String databaseName = StringUtils.hasText(vectorStoreProperties.getDatabaseName())
                 ? vectorStoreProperties.getDatabaseName()
                 : MilvusVectorStore.DEFAULT_DATABASE_NAME;
 
         // 如果业务配置了非默认数据库，先用管理连接确保数据库存在，再切换到目标库。
-        if (!MilvusVectorStore.DEFAULT_DATABASE_NAME.equals(databaseName)) {
+        if (aiAgentProperties.getBootstrap().isEnabled()
+                && !MilvusVectorStore.DEFAULT_DATABASE_NAME.equals(databaseName)) {
             MilvusServiceClient adminClient = new MilvusServiceClient(baseConnectParamBuilder(clientProperties).build());
             ensureDatabaseExists(adminClient, databaseName);
             closeQuietly(adminClient);
@@ -80,44 +90,84 @@ public class CommonConfiguration {
     }
 
     @Bean("knowledgeVectorStore")
-    public VectorStore knowledgeVectorStore(MilvusServiceClient milvusServiceClient,
+    public VectorStore knowledgeVectorStore(ObjectProvider<MilvusServiceClient> milvusClientProvider,
                                             EmbeddingModel embeddingModel,
                                             MilvusVectorStoreProperties properties,
                                             AiAgentProperties aiAgentProperties) {
-        return buildVectorStore(milvusServiceClient, embeddingModel, properties, aiAgentProperties.getRag().getCollections().getKnowledge());
+        return buildVectorStore(milvusClientProvider, embeddingModel, properties,
+                aiAgentProperties.getRag().getCollections().getKnowledge(), aiAgentProperties);
     }
 
     @Bean("shopProfileVectorStore")
-    public VectorStore shopProfileVectorStore(MilvusServiceClient milvusServiceClient,
+    public VectorStore shopProfileVectorStore(ObjectProvider<MilvusServiceClient> milvusClientProvider,
                                               EmbeddingModel embeddingModel,
                                               MilvusVectorStoreProperties properties,
                                               AiAgentProperties aiAgentProperties) {
-        return buildVectorStore(milvusServiceClient, embeddingModel, properties, aiAgentProperties.getRag().getCollections().getShopProfile());
+        return buildVectorStore(milvusClientProvider, embeddingModel, properties,
+                aiAgentProperties.getRag().getCollections().getShopProfile(), aiAgentProperties);
     }
 
     @Bean("blogReviewVectorStore")
-    public VectorStore blogReviewVectorStore(MilvusServiceClient milvusServiceClient,
+    public VectorStore blogReviewVectorStore(ObjectProvider<MilvusServiceClient> milvusClientProvider,
                                              EmbeddingModel embeddingModel,
                                              MilvusVectorStoreProperties properties,
                                              AiAgentProperties aiAgentProperties) {
-        return buildVectorStore(milvusServiceClient, embeddingModel, properties, aiAgentProperties.getRag().getCollections().getBlogReview());
+        return buildVectorStore(milvusClientProvider, embeddingModel, properties,
+                aiAgentProperties.getRag().getCollections().getBlogReview(), aiAgentProperties);
     }
 
-    private VectorStore buildVectorStore(MilvusServiceClient milvusServiceClient,
+    private VectorStore buildVectorStore(ObjectProvider<MilvusServiceClient> milvusClientProvider,
                                          EmbeddingModel embeddingModel,
                                          MilvusVectorStoreProperties properties,
-                                         String collectionName) {
+                                         String collectionName,
+                                         AiAgentProperties aiAgentProperties) {
+        if (!aiAgentProperties.getRag().isVectorStoreEnabled()) {
+            return inMemoryVectorStore(embeddingModel, collectionName, "Milvus vector store disabled");
+        }
+
+        boolean bootstrapEnabled = aiAgentProperties.getBootstrap().isEnabled();
         String databaseName = properties.getDatabaseName();
         int embeddingDimension = properties.getEmbeddingDimension() > 0 ? properties.getEmbeddingDimension() : 1024;
-        // 向量维度变更时，旧 collection 继续复用会直接报错，这里启动时先做一次防御性检查。
-        resetCollectionIfDimensionMismatch(milvusServiceClient, databaseName, collectionName, embeddingDimension, properties.isInitializeSchema());
-        return MilvusVectorStore.builder(milvusServiceClient, embeddingModel)
-                .databaseName(databaseName)
-                .collectionName(collectionName)
-                .embeddingDimension(embeddingDimension)
-                .initializeSchema(properties.isInitializeSchema())
-                .batchingStrategy(fixedSizeBatchingStrategy(10))
-                .build();
+        try {
+            MilvusServiceClient milvusServiceClient = milvusClientProvider.getObject();
+            if (!bootstrapEnabled) {
+                requireExistingCollection(milvusServiceClient, databaseName, collectionName);
+            }
+            // 向量维度变更时，旧 collection 继续复用会直接报错，这里启动时先做一次防御性检查。
+            resetCollectionIfDimensionMismatch(milvusServiceClient, databaseName, collectionName,
+                    embeddingDimension, bootstrapEnabled && properties.isInitializeSchema(),
+                    bootstrapEnabled && aiAgentProperties.getRag().isAllowDestructiveCollectionReset());
+            return MilvusVectorStore.builder(milvusServiceClient, embeddingModel)
+                    .databaseName(databaseName)
+                    .collectionName(collectionName)
+                    .embeddingDimension(embeddingDimension)
+                    .initializeSchema(bootstrapEnabled && properties.isInitializeSchema())
+                    .batchingStrategy(fixedSizeBatchingStrategy(10))
+                    .build();
+        } catch (RuntimeException e) {
+            if (aiAgentProperties.getBootstrap().isFailFast()) {
+                throw e;
+            }
+            log.warn("Milvus collection {} is unavailable; using a process-local vector store", collectionName, e);
+            return inMemoryVectorStore(embeddingModel, collectionName, "Milvus unavailable");
+        }
+    }
+
+    private void requireExistingCollection(MilvusServiceClient client, String databaseName,
+                                           String collectionName) {
+        Boolean hasCollection = client.hasCollection(HasCollectionParam.newBuilder()
+                .withDatabaseName(databaseName)
+                .withCollectionName(collectionName)
+                .build()).getData();
+        if (!Boolean.TRUE.equals(hasCollection)) {
+            throw new IllegalStateException("Milvus collection " + collectionName
+                    + " 不存在，当前 bootstrap 已关闭，不能自动创建索引");
+        }
+    }
+
+    private VectorStore inMemoryVectorStore(EmbeddingModel embeddingModel, String collectionName, String reason) {
+        log.warn("Using process-local vector store for {} because {}", collectionName, reason);
+        return SimpleVectorStore.builder(embeddingModel).build();
     }
 
     private BatchingStrategy fixedSizeBatchingStrategy(int batchSize) {
@@ -131,11 +181,12 @@ public class CommonConfiguration {
         };
     }
 
-    private void resetCollectionIfDimensionMismatch(MilvusServiceClient client,
-                                                    String databaseName,
-                                                    String collectionName,
-                                                    int expectedDimension,
-                                                    boolean initializeSchema) {
+    void resetCollectionIfDimensionMismatch(MilvusServiceClient client,
+                                            String databaseName,
+                                            String collectionName,
+                                            int expectedDimension,
+                                            boolean initializeSchema,
+                                            boolean allowDestructiveReset) {
         try {
             Boolean hasCollection = client.hasCollection(HasCollectionParam.newBuilder()
                     .withDatabaseName(databaseName)
@@ -163,13 +214,14 @@ public class CommonConfiguration {
                 return;
             }
 
-            if (!initializeSchema) {
+            if (!initializeSchema || !allowDestructiveReset) {
                 throw new IllegalStateException("Milvus collection " + collectionName + " 的向量维度为 "
                         + actualDimension + "，但当前配置需要 " + expectedDimension
-                        + "。请开启 initialize-schema 或手工删除旧 collection。");
+                        + "。自动删除旧 collection 默认关闭；备份并准备重建索引后，需同时开启 "
+                        + "initialize-schema 和 ai.agent.rag.allow-destructive-collection-reset。");
             }
 
-            // 自动删库重建的前提是应用明确允许初始化 schema，否则宁可启动失败也不做隐式破坏。
+            // 删除已有数据需要 initialize-schema 与专用破坏性开关同时明确授权。
             log.warn("Milvus collection {} dimension mismatch: actual={}, expected={}. Dropping and recreating it.",
                     collectionName, actualDimension, expectedDimension);
             client.dropCollection(DropCollectionParam.newBuilder()

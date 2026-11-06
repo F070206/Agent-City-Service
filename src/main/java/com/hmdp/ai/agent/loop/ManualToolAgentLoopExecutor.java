@@ -4,6 +4,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hmdp.ai.agent.prompt.AgentLoopPromptProvider;
 import com.hmdp.ai.config.AiAgentProperties;
+import com.hmdp.ai.config.AiInputLimits;
+import com.hmdp.ai.config.AiDependencyGuard;
+import com.hmdp.ai.service.impl.AiTaskLease;
+import com.hmdp.ai.service.impl.AiTaskLeaseLostException;
 import com.hmdp.component.AgentLoopObserver;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -32,6 +36,8 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class ManualToolAgentLoopExecutor {
 
+    private static final int MAX_AGENT_STEPS = 50;
+
     private final ChatModel chatModel;
     private final AgentLoopToolRegistry toolRegistry;
     private final AgentLoopPromptProvider promptProvider;
@@ -43,8 +49,14 @@ public class ManualToolAgentLoopExecutor {
     }
 
     public AgentLoopExecution execute(AgentLoopRequest request, List<ToolExecutionLog> toolLogs, AgentLoopObserver observer) {
+        return execute(request, toolLogs, observer, null);
+    }
+
+    public AgentLoopExecution execute(AgentLoopRequest request, List<ToolExecutionLog> toolLogs,
+                                      AgentLoopObserver observer, AiTaskLease lease) {
         AgentLoopExecution execution = new AgentLoopExecution();
-        execution.setMaxSteps(Math.max(aiAgentProperties.getMultiAgent().getMaxSteps(), 1));
+        execution.setMaxSteps(Math.min(Math.max(aiAgentProperties.getMultiAgent().getMaxSteps(), 1),
+                MAX_AGENT_STEPS));
 
         boolean simpleRecommendationRequest = isSimpleRecommendationRequest(request);
         boolean terminateNudgeSent = false;
@@ -57,24 +69,36 @@ public class ManualToolAgentLoopExecutor {
         messages.add(new UserMessage(promptProvider.buildUserPrompt(request)));
 
         int blankResponseCount = 0;
+        int toolContextChars = 0;
         recordTrace(execution, toolLogs, observer, 0, AgentLoopStatus.IDLE, "AgentLoop 初始化完成", List.of());
         for (int step = 1; step <= execution.getMaxSteps(); step++) {
+            assertLeaseActive(lease);
             execution.setTotalSteps(step);
             recordTrace(execution, toolLogs, observer, step, AgentLoopStatus.THINKING, "第 " + step + " 轮开始思考", List.of());
             ChatResponse response;
             try {
-                response = chatModel.call(new Prompt(messages, buildLoopOptions()));
+                response = AiDependencyGuard.call("ai:model:think",
+                        () -> {
+                            ChatResponse modelResponse = chatModel.call(new Prompt(messages, buildLoopOptions()));
+                            if (modelResponse == null || modelResponse.getResults() == null
+                                    || modelResponse.getResults().isEmpty()
+                                    || modelResponse.getResults().get(0) == null
+                                    || modelResponse.getResults().get(0).getOutput() == null) {
+                                throw new IllegalStateException("模型未返回可用结果");
+                            }
+                            return modelResponse;
+                        });
             } catch (Exception ex) {
                 log.warn("AgentLoop thinking failed at step={}", step, ex);
                 execution.setStatus(AgentLoopStatus.ERROR);
                 execution.setErrorMessage("模型思考阶段失败：" + ex.getMessage());
-                execution.setFinalAnswer("抱歉，当前多轮推理过程中模型调用失败，请稍后重试。"
-                        + (StringUtils.hasText(execution.getErrorMessage()) ? "（" + execution.getErrorMessage() + "）" : ""));
+                execution.setFinalAnswer("抱歉，当前多轮推理过程中模型调用失败，请稍后重试。");
                 recordTrace(execution, toolLogs, observer, step, AgentLoopStatus.ERROR, execution.getErrorMessage(), List.of());
                 return execution;
             }
+            assertLeaseActive(lease);
 
-            AssistantMessage assistantMessage = response.getResult().getOutput();
+            AssistantMessage assistantMessage = response.getResults().get(0).getOutput();
             messages.add(assistantMessage);
             if (!assistantMessage.hasToolCalls()) {
                 String answer = assistantMessage.getText();
@@ -101,6 +125,15 @@ public class ManualToolAgentLoopExecutor {
             List<String> toolNames = assistantMessage.getToolCalls().stream().map(AssistantMessage.ToolCall::name).toList();
             recordTrace(execution, toolLogs, observer, step, AgentLoopStatus.EXECUTING, "模型请求执行工具", toolNames);
 
+            if (assistantMessage.getToolCalls().size() > 1) {
+                execution.setStatus(AgentLoopStatus.ERROR);
+                execution.setErrorMessage("模型单轮请求了多个工具调用，已拒绝执行。");
+                execution.setFinalAnswer("抱歉，当前模型一次请求了多个工具，任务已中止，请稍后重试。");
+                recordTrace(execution, toolLogs, observer, step, AgentLoopStatus.ERROR,
+                        execution.getErrorMessage(), toolNames);
+                return execution;
+            }
+
             TerminateDecision terminateDecision = extractTerminateDecision(assistantMessage.getToolCalls());
             if (terminateDecision != null && assistantMessage.getToolCalls().size() == 1) {
                 execution.setStatus(AgentLoopStatus.FINISHED);
@@ -114,6 +147,7 @@ public class ManualToolAgentLoopExecutor {
 
             List<ToolResponseMessage.ToolResponse> toolResponses = new ArrayList<>();
             for (AssistantMessage.ToolCall toolCall : assistantMessage.getToolCalls()) {
+                assertLeaseActive(lease);
                 if ("terminate".equals(toolCall.name())) {
                     continue;
                 }
@@ -125,20 +159,34 @@ public class ManualToolAgentLoopExecutor {
                     recordTrace(execution, toolLogs, observer, step, AgentLoopStatus.ERROR, execution.getErrorMessage(), List.of(toolCall.name()));
                     return execution;
                 }
+                if (toolContextChars >= AiInputLimits.MAX_AGENT_TOOL_CONTEXT_CHARS) {
+                    execution.setStatus(AgentLoopStatus.FINISHED);
+                    execution.setFinalAnswer("本轮已获取较多工具信息，我先根据已有内容整理回答。");
+                    recordTrace(execution, toolLogs, observer, step, AgentLoopStatus.FINISHED,
+                            "工具结果达到本轮上下文上限，停止继续调用", List.of(toolCall.name()));
+                    return execution;
+                }
                 try {
                     String responseData = toolCallback.call(toolCall.arguments(), new ToolContext(Map.of(
                             ToolContext.TOOL_CALL_HISTORY, List.copyOf(messages)
                     )));
-                    toolResponses.add(new ToolResponseMessage.ToolResponse(toolCall.id(), toolCall.name(), responseData));
+                    assertLeaseActive(lease);
+                    int availableChars = AiInputLimits.MAX_AGENT_TOOL_CONTEXT_CHARS - toolContextChars;
+                    int responseLimit = Math.min(AiInputLimits.MAX_AGENT_TOOL_OUTPUT_CHARS, availableChars);
+                    String boundedResponse = truncateToolResponse(responseData, responseLimit);
+                    toolContextChars += boundedResponse.length();
+                    toolResponses.add(new ToolResponseMessage.ToolResponse(
+                            toolCall.id(), toolCall.name(), boundedResponse));
                     ToolExecutionLog toolLog = new ToolExecutionLog(toolCall.name(), truncatePayload(responseData));
                     toolLogs.add(toolLog);
                     notifyToolExecuted(observer, toolLog);
+                } catch (AiTaskLeaseLostException ex) {
+                    throw ex;
                 } catch (Exception ex) {
                     log.warn("AgentLoop tool execution failed for tool={}", toolCall.name(), ex);
                     execution.setStatus(AgentLoopStatus.ERROR);
                     execution.setErrorMessage("工具执行失败：" + toolCall.name() + " - " + ex.getMessage());
-                    execution.setFinalAnswer("抱歉，当前多轮推理在执行工具时失败，请稍后重试。"
-                            + (StringUtils.hasText(execution.getErrorMessage()) ? "（" + execution.getErrorMessage() + "）" : ""));
+                    execution.setFinalAnswer("抱歉，当前多轮推理在执行工具时失败，请稍后重试。");
                     recordTrace(execution, toolLogs, observer, step, AgentLoopStatus.ERROR, execution.getErrorMessage(), List.of(toolCall.name()));
                     return execution;
                 }
@@ -153,11 +201,18 @@ public class ManualToolAgentLoopExecutor {
             }
         }
 
+        assertLeaseActive(lease);
         execution.setStatus(AgentLoopStatus.ERROR);
         execution.setErrorMessage("AgentLoop 超过最大步数限制：" + execution.getMaxSteps());
         execution.setFinalAnswer("抱歉，当前任务在 " + execution.getMaxSteps() + " 轮内仍未完成，已主动停止以避免无限循环。你可以补充更明确的条件后再试。");
         recordTrace(execution, toolLogs, observer, execution.getMaxSteps(), AgentLoopStatus.ERROR, execution.getErrorMessage(), List.of());
         return execution;
+    }
+
+    private void assertLeaseActive(AiTaskLease lease) {
+        if (lease != null) {
+            lease.assertActive();
+        }
     }
 
     private ChatOptions buildLoopOptions() {
@@ -256,6 +311,8 @@ public class ManualToolAgentLoopExecutor {
     private void notifyTrace(AgentLoopObserver observer, AgentLoopTrace trace) {
         try {
             observer.onTrace(trace);
+        } catch (AiTaskLeaseLostException ex) {
+            throw ex;
         } catch (Exception ex) {
             log.warn("AgentLoop observer trace callback failed", ex);
         }
@@ -264,6 +321,8 @@ public class ManualToolAgentLoopExecutor {
     private void notifyToolExecuted(AgentLoopObserver observer, ToolExecutionLog toolLog) {
         try {
             observer.onToolExecuted(toolLog);
+        } catch (AiTaskLeaseLostException ex) {
+            throw ex;
         } catch (Exception ex) {
             log.warn("AgentLoop observer tool callback failed", ex);
         }
@@ -274,6 +333,17 @@ public class ManualToolAgentLoopExecutor {
             return payload;
         }
         return payload.substring(0, 1200) + "...";
+    }
+
+    private String truncateToolResponse(String response, int maxChars) {
+        if (response == null || response.length() <= maxChars) {
+            return response == null ? "" : response;
+        }
+        String suffix = "\n[工具结果已截断]";
+        if (maxChars <= suffix.length()) {
+            return suffix.substring(0, maxChars);
+        }
+        return response.substring(0, maxChars - suffix.length()) + suffix;
     }
 
     private record TerminateDecision(String answer, String reason) {

@@ -9,9 +9,9 @@
       </div>
 
       <div class="meta-row">
-        <el-rate :model-value="shop.score" disabled allow-half size="small" />
-        <span>{{ shop.score }}</span>
-        <span>人均 ¥{{ shop.price }}</span>
+        <el-rate v-if="shop.score != null" :model-value="shop.score" disabled allow-half size="small" />
+        <span>{{ shop.score == null ? '暂无评分' : shop.score }}</span>
+        <span>{{ shop.price > 0 ? `人均 ¥${shop.price}` : '暂无人均价格' }}</span>
         <span>{{ shop.distance }}</span>
       </div>
 

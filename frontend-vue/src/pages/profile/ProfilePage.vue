@@ -17,11 +17,16 @@
             </div>
           </div>
           <div class="profile-actions">
-            <el-button :type="signedToday ? 'success' : 'default'" :disabled="signedToday" @click="signToday">
+            <el-button
+              :type="signedToday ? 'success' : 'default'"
+              :disabled="signedToday || signing"
+              :loading="signing"
+              @click="signToday"
+            >
               {{ signedToday ? `今日已签到（已连续 ${userStore.signCount} 天）` : '今日签到' }}
             </el-button>
             <el-button @click="openPanel('publish')">发布笔记</el-button>
-            <el-button type="primary" @click="userStore.logout()">退出登录</el-button>
+            <el-button type="primary" @click="logout">退出登录</el-button>
           </div>
         </section>
 
@@ -56,6 +61,13 @@
             <p>真实联调 `/blog/of/me`</p>
           </div>
           <div class="my-blog-list">
+            <div v-if="blogLoadError" class="empty-block">
+              <span>{{ blogLoadError }}</span>
+              <el-button link type="primary" :disabled="loadingBlogs" @click="loadMyBlogs()">
+                {{ loadingBlogs ? '正在重试…' : '重试' }}
+              </el-button>
+            </div>
+            <div v-else-if="loadingBlogs && !myBlogs.length" class="empty-block">正在加载笔记…</div>
             <article v-for="blog in myBlogs" :key="blog.id" class="my-blog-item hover-lift">
               <div class="blog-main">
                 <strong>{{ blog.title || '无标题笔记' }}</strong>
@@ -71,7 +83,7 @@
                 <el-button v-if="blog.shopId" size="small" type="primary" @click="goShop(blog.shopId)">去店铺</el-button>
               </div>
             </article>
-            <div v-if="!myBlogs.length" class="empty-block">当前还没有发布笔记</div>
+            <div v-if="!loadingBlogs && !blogLoadError && !myBlogs.length" class="empty-block">当前还没有发布笔记</div>
           </div>
         </section>
       </template>
@@ -79,8 +91,15 @@
 
     <BottomNav current-tab="profile" />
 
-    <el-dialog v-model="dialogs.favorites" title="我的收藏" width="760px">
+    <el-dialog v-model="dialogs.favorites" title="我的收藏（保存在此浏览器）" width="760px">
       <div class="dialog-list">
+        <div v-if="favoriteLoadError" class="empty-block">
+          <span>{{ favoriteLoadError }}</span>
+          <el-button link type="primary" :disabled="loadingFavorites" @click="loadFavoriteShops()">
+            {{ loadingFavorites ? '正在重试…' : '重试' }}
+          </el-button>
+        </div>
+        <div v-else-if="loadingFavorites && !favoriteShops.length" class="empty-block">正在加载收藏店铺…</div>
         <article v-for="shop in favoriteShops" :key="shop.id" class="panel-item hover-lift">
           <div>
             <strong>{{ shop.name }}</strong>
@@ -92,7 +111,7 @@
             <el-button size="small" type="danger" @click="removeFavorite(shop.id)">取消收藏</el-button>
           </div>
         </article>
-        <div v-if="!favoriteShops.length" class="empty-block">当前还没有收藏店铺</div>
+        <div v-if="!loadingFavorites && !favoriteLoadError && !favoriteShops.length" class="empty-block">当前还没有收藏店铺</div>
       </div>
     </el-dialog>
 
@@ -100,17 +119,27 @@
       <div class="dialog-list">
         <article v-for="order in userStore.orderHistory" :key="order.orderId" class="panel-item hover-lift">
           <div>
-            <strong>{{ order.shopName || '未知店铺' }} ｜ {{ order.voucherTitle || '代金券订单' }}</strong>
-            <p>订单ID：{{ order.orderId }} ｜ 支付金额 ¥{{ order.payAmount || '-' }}</p>
-            <span>{{ formatOrderStatus(order.status) }} ｜ {{ formatTime(order.updateTime || order.createdTime) }}</span>
+            <strong>{{ order.shopName || (order.shopId ? `店铺 ${order.shopId}` : '未知店铺') }} ｜ {{ order.voucherTitle || '代金券订单' }}</strong>
+            <p>订单ID：{{ order.orderId }} ｜ 支付金额 ¥{{ displayOrderAmount(order) }}</p>
+            <span>{{ order.creationPending ? '订单创建中' : formatOrderStatus(order.status) }} ｜ {{ formatTime(order.updateTime || order.createdTime) }}</span>
           </div>
           <div class="panel-actions">
-            <el-button size="small" @click="refreshOrderStatus(order)">刷新状态</el-button>
+            <el-button
+              size="small"
+              :loading="refreshingOrderIds.has(String(order.orderId))"
+              :disabled="refreshingOrderIds.has(String(order.orderId))"
+              @click="refreshOrderStatus(order)"
+            >刷新状态</el-button>
             <el-button v-if="order.shopId" size="small" @click="goShop(order.shopId)">查看店铺</el-button>
-            <el-button size="small" type="danger" @click="removeOrder(order.orderId)">移除记录</el-button>
+            <el-button v-if="order.localOnly" size="small" type="danger" @click="removeOrder(order.orderId)">移除本地记录</el-button>
           </div>
         </article>
         <div v-if="!userStore.orderHistory.length" class="empty-block">当前还没有下单记录</div>
+        <div v-if="hasMoreRemoteOrders" class="load-box">
+          <el-button plain :loading="loadingMoreOrders" :disabled="loadingMoreOrders" @click="loadMoreOrders">
+            加载更多订单
+          </el-button>
+        </div>
       </div>
     </el-dialog>
 
@@ -128,7 +157,7 @@
             <p>{{ address.city }} {{ address.detail }}</p>
           </div>
           <div class="panel-actions">
-            <el-button size="small" type="danger" @click="userStore.removeAddress(address.id)">删除</el-button>
+            <el-button size="small" type="danger" @click="removeAddress(address.id)">删除</el-button>
           </div>
         </article>
         <div v-if="!userStore.addressList.length" class="empty-block">你还没有保存常用地址</div>
@@ -138,9 +167,9 @@
     <el-dialog v-model="dialogs.settings" title="设置" width="520px">
       <div class="setting-actions">
         <el-button @click="clearAiHistory">清空 AI 记录</el-button>
-        <el-button @click="userStore.clearFavorites()">清空收藏</el-button>
+        <el-button @click="clearFavorites">清空收藏</el-button>
         <el-button @click="userStore.clearOrders()">清空订单记录</el-button>
-        <el-button type="danger" @click="userStore.logout()">退出登录</el-button>
+        <el-button type="danger" @click="logout">退出登录</el-button>
       </div>
     </el-dialog>
 
@@ -152,7 +181,7 @@
       </div>
     </el-dialog>
 
-    <el-dialog v-model="dialogs.reviews" title="我的评论" width="760px">
+    <el-dialog v-model="dialogs.blogs" title="我的笔记" width="760px">
       <div class="dialog-list">
         <article v-for="blog in myBlogs" :key="blog.id" class="panel-item hover-lift">
           <div>
@@ -165,25 +194,55 @@
             <el-button v-if="blog.shopId" size="small" @click="goShop(blog.shopId)">去店铺</el-button>
           </div>
         </article>
-        <div v-if="!myBlogs.length" class="empty-block">你还没有评论内容</div>
+        <div v-if="!myBlogs.length" class="empty-block">你还没有发布笔记</div>
       </div>
     </el-dialog>
 
-    <el-dialog v-model="dialogs.publish" title="发布笔记" width="640px" @close="resetBlogForm">
+    <el-dialog
+      v-model="dialogs.publish"
+      title="发布笔记"
+      width="640px"
+      :close-on-click-modal="false"
+      :before-close="guardPublishDialogClose"
+      @close="handlePublishDialogClose"
+    >
       <div class="publish-form">
-        <el-input v-model="blogForm.shopId" placeholder="店铺ID（可选）" />
-        <el-input v-model="blogForm.title" placeholder="标题" />
-        <el-input v-model="blogForm.images" placeholder="图片地址，多个用英文逗号分隔" />
+        <el-input v-model="blogForm.shopId" placeholder="店铺ID（必填）" />
+        <el-input v-model="blogForm.title" maxlength="255" placeholder="标题" />
+        <el-input
+          v-model="blogForm.images"
+          :disabled="uploadedBlogImages.length > 0"
+          placeholder="图片地址（可选，多个地址用英文逗号分隔）"
+        />
+        <div class="blog-image-upload">
+          <input
+            ref="blogImageInput"
+            type="file"
+            accept="image/png,image/jpeg,image/gif,image/webp"
+            multiple
+            :disabled="uploadingImages || publishing"
+            @change="uploadBlogImages"
+          />
+          <el-button :loading="uploadingImages" :disabled="publishing" @click="blogImageInput?.click()">
+            选择并上传图片
+          </el-button>
+          <span>{{ blogImageList.length }}/9 张图片，每张不超过 8 MiB</span>
+        </div>
+        <div v-if="blogImageList.length" class="uploaded-image-list">
+          <img v-for="image in blogImageList" :key="image" :src="image" alt="笔记图片预览" />
+        </div>
         <el-input
           v-model="blogForm.content"
           type="textarea"
           :rows="6"
+          maxlength="2048"
+          show-word-limit
           resize="none"
           placeholder="分享一下你的探店体验"
         />
         <div class="publish-actions">
-          <el-button @click="resetBlogForm">重置</el-button>
-          <el-button type="primary" :loading="publishing" @click="publishBlog">发布</el-button>
+          <el-button :disabled="uploadingImages || publishing" @click="resetBlogForm()">重置</el-button>
+          <el-button type="primary" :loading="publishing" :disabled="uploadingImages" @click="publishBlog">发布</el-button>
         </div>
       </div>
     </el-dialog>
@@ -214,23 +273,50 @@
 import { ElMessage } from 'element-plus';
 import { ArrowRight } from '@element-plus/icons-vue';
 import BottomNav from '@/components/layout/BottomNav.vue';
-import { profileApi } from '@/api/modules/profile';
 import { blogApi } from '@/api/modules/blog';
 import { paymentApi } from '@/api/modules/payment';
+import { orderApi } from '@/api/modules/order';
+import {
+  beginOrderStatusRefresh,
+  endOrderStatusRefresh,
+  hasMoreOrderPages,
+  mergeOrderPage,
+  orderPageFromResult
+} from '@/utils/orders';
+import { canUploadBlogImages, mergeUploadedBlogImages } from '@/utils/blog-image-drafts';
+import { createUserScopeGuard } from '@/utils/user-scope';
+import { loadFavoriteShops as fetchFavoriteShops } from '@/utils/favorite-load';
 import { shopApi } from '@/api/modules/shop';
 import { useAiStore } from '@/store/ai';
 import { useUserStore } from '@/store/user';
 
+const MAX_BLOG_IMAGE_SIZE_BYTES = 8 * 1024 * 1024;
 const router = useRouter();
 const userStore = useUserStore();
 const aiStore = useAiStore();
 
 const profile = ref({ avatar: '', nickname: '' });
 const myBlogs = ref([]);
+const loadingBlogs = ref(false);
+const blogLoadError = ref('');
+let blogLoadRequestId = 0;
+const profileScopeGuard = createUserScopeGuard();
+let activeProfileTicket = null;
 const favoriteShops = ref([]);
+const loadingFavorites = ref(false);
+const favoriteLoadError = ref('');
+const signing = ref(false);
+const remoteOrderPage = ref(1);
+const hasMoreRemoteOrders = ref(false);
+const loadingMoreOrders = ref(false);
+const refreshingOrderIds = ref(new Set());
 const publishing = ref(false);
+const uploadingImages = ref(false);
+const uploadedBlogImages = ref([]);
+const blogImageInput = ref(null);
 const blogDetailVisible = ref(false);
 const activeBlog = ref(null);
+let remoteOrderRequestId = 0;
 
 const dialogs = reactive({
   favorites: false,
@@ -239,17 +325,18 @@ const dialogs = reactive({
   settings: false,
   support: false,
   publish: false,
-  reviews: false
+  blogs: false
 });
 
 const addressForm = reactive({ contact: '', phone: '', detail: '' });
 const blogForm = reactive({ shopId: '', title: '', images: '', content: '' });
+const blogImageList = computed(() => blogForm.images.split(',').map((image) => image.trim()).filter(Boolean));
 
 const signedToday = computed(() => Number(userStore.signCount) > 0);
 const stats = computed(() => [
   { key: 'favorites', title: '我的收藏', value: userStore.favoriteShopIds.length },
   { key: 'orders', title: '我的订单', value: userStore.orderHistory.length },
-  { key: 'reviews', title: '我的评论', value: myBlogs.value.length }
+  { key: 'blogs', title: '我的笔记', value: myBlogs.value.length }
 ]);
 
 const menuEntries = [
@@ -259,20 +346,139 @@ const menuEntries = [
 ];
 
 watch(
-  () => userStore.isLoggedIn,
-  (loggedIn) => {
-    if (loggedIn) {
-      loadProfile();
+  () => [userStore.token, userStore.profile?.id ?? null],
+  ([token, userId], previousScope) => {
+    const [previousToken] = Array.isArray(previousScope) ? previousScope : [];
+    const scopeChanged = Array.isArray(previousScope)
+      && (token !== previousToken || userId !== previousScope[1]);
+    const staleDraftImages = scopeChanged ? [...uploadedBlogImages.value] : [];
+    if (scopeChanged) {
+      uploadedBlogImages.value = [];
+      clearBlogFormFields();
+      uploadingImages.value = false;
+      publishing.value = false;
+      if (blogImageInput.value) blogImageInput.value.value = '';
     }
+    blogLoadRequestId += 1;
+    remoteOrderRequestId += 1;
+    myBlogs.value = [];
+    favoriteShops.value = [];
+    favoriteLoadError.value = '';
+    loadingFavorites.value = false;
+    blogLoadError.value = '';
+    loadingBlogs.value = false;
+    loadingMoreOrders.value = false;
+    refreshingOrderIds.value = new Set();
+    remoteOrderPage.value = 1;
+    hasMoreRemoteOrders.value = false;
+    profile.value = { avatar: '', nickname: '' };
+    activeBlog.value = null;
+    blogDetailVisible.value = false;
+    for (const key of Object.keys(dialogs)) dialogs[key] = false;
+
+    if (staleDraftImages.length && previousToken) {
+      void deleteStagedBlogImages(staleDraftImages, previousToken).then((failedCount) => {
+        if (failedCount) console.warn(`Could not remove ${failedCount} stale blog draft image(s)`);
+      });
+    }
+
+    if (!token || userId == null) {
+      activeProfileTicket = null;
+      profileScopeGuard.invalidate();
+      return;
+    }
+
+    activeProfileTicket = profileScopeGuard.begin(JSON.stringify([String(userId), token]));
+    loadProfile(activeProfileTicket);
   },
   { immediate: true }
 );
 
-async function loadProfile() {
-  if (!userStore.isLoggedIn) return;
-  const data = await profileApi.getProfile();
-  profile.value = data.profile;
-  myBlogs.value = (await blogApi.getMy(1).catch(() => [])).map(normalizeBlog);
+function isCurrentProfile(ticket) {
+  const userId = userStore.profile?.id;
+  const token = userStore.token;
+  const currentScope = token && userId != null ? JSON.stringify([String(userId), token]) : null;
+  return profileScopeGuard.isCurrent(ticket, currentScope);
+}
+
+async function loadProfile(ticket) {
+  if (!isCurrentProfile(ticket)) return;
+  profile.value = {
+    avatar: userStore.profile?.avatar || 'https://dummyimage.com/120x120/ff6700/ffffff&text=U',
+    nickname: userStore.profile?.nickname || '用户'
+  };
+  const [blogsResult, remoteOrders] = await Promise.allSettled([
+    loadMyBlogs(ticket),
+    orderApi.getMy(1)
+  ]);
+  if (!isCurrentProfile(ticket)) return;
+  if (blogsResult.status === 'rejected') {
+    // loadMyBlogs handles its own errors; keep this guard for unexpected failures.
+    blogLoadError.value = '笔记加载失败，请重试';
+  }
+  const orders = orderPageFromResult(remoteOrders);
+  if (orders === null) {
+    ElMessage.warning('订单列表暂时无法同步，当前显示本地记录');
+    return;
+  }
+  remoteOrderPage.value = 1;
+  hasMoreRemoteOrders.value = hasMoreOrderPages(orders, remoteOrderPage.value);
+  mergeRemoteOrders(orders);
+}
+
+async function loadMyBlogs(ticket = activeProfileTicket) {
+  if (!isCurrentProfile(ticket)) return;
+  const requestId = ++blogLoadRequestId;
+  loadingBlogs.value = true;
+  blogLoadError.value = '';
+  try {
+    const blogs = await blogApi.getMy(1);
+    if (!Array.isArray(blogs)) throw new Error('笔记数据格式错误');
+    if (requestId !== blogLoadRequestId || !isCurrentProfile(ticket)) return;
+    myBlogs.value = blogs.map(normalizeBlog);
+  } catch (error) {
+    if (requestId === blogLoadRequestId && isCurrentProfile(ticket)) {
+      blogLoadError.value = error?.message || '笔记加载失败，请重试';
+    }
+  } finally {
+    if (requestId === blogLoadRequestId && isCurrentProfile(ticket)) {
+      loadingBlogs.value = false;
+    }
+  }
+}
+
+function mergeRemoteOrders(remoteOrders, append = false) {
+  userStore.orderHistory = mergeOrderPage(userStore.orderHistory, remoteOrders, append);
+  userStore.persistOrders();
+}
+
+async function loadMoreOrders() {
+  if (loadingMoreOrders.value || !hasMoreRemoteOrders.value) return;
+  const ticket = activeProfileTicket;
+  if (!isCurrentProfile(ticket)) return;
+  const requestId = ++remoteOrderRequestId;
+  loadingMoreOrders.value = true;
+  try {
+    const nextPage = remoteOrderPage.value + 1;
+    const orders = await orderApi.getMy(nextPage);
+    if (requestId !== remoteOrderRequestId || !isCurrentProfile(ticket)) return;
+    if (!Array.isArray(orders)) throw new Error('订单列表数据格式错误');
+    mergeRemoteOrders(orders, true);
+    remoteOrderPage.value = nextPage;
+    hasMoreRemoteOrders.value = hasMoreOrderPages(orders, remoteOrderPage.value);
+  } catch (error) {
+    if (requestId === remoteOrderRequestId && isCurrentProfile(ticket)) {
+      ElMessage.error(error?.message || '加载更多订单失败');
+    }
+  } finally {
+    if (requestId === remoteOrderRequestId) loadingMoreOrders.value = false;
+  }
+}
+
+function displayOrderAmount(order) {
+  if (order.payAmount) return order.payAmount;
+  if (order.payValue != null) return (Number(order.payValue) / 100).toFixed(2);
+  return '-';
 }
 
 function normalizeBlog(blog) {
@@ -286,12 +492,27 @@ function normalizeBlog(blog) {
 }
 
 async function signToday() {
-  if (signedToday.value) {
+  if (signedToday.value || signing.value) {
     ElMessage.info('今日已经签到过了');
     return;
   }
-  await userStore.signToday();
-  ElMessage.success('签到成功');
+  signing.value = true;
+  try {
+    await userStore.signToday();
+    ElMessage.success('签到成功');
+  } catch (error) {
+    ElMessage.error(error?.message || '签到失败，请稍后重试');
+  } finally {
+    signing.value = false;
+  }
+}
+
+async function logout() {
+  try {
+    await userStore.logout();
+  } catch (error) {
+    ElMessage.error(error?.message || '服务端退出失败，请稍后重试');
+  }
 }
 
 async function openPanel(key) {
@@ -304,8 +525,8 @@ async function openPanel(key) {
     dialogs.orders = true;
     return;
   }
-  if (key === 'reviews') {
-    dialogs.reviews = true;
+  if (key === 'blogs') {
+    dialogs.blogs = true;
     return;
   }
   if (key === 'publish') {
@@ -316,14 +537,49 @@ async function openPanel(key) {
 }
 
 async function loadFavoriteShops() {
-  const results = await Promise.allSettled(userStore.favoriteShopIds.map((shopId) => shopApi.getDetail(shopId)));
-  favoriteShops.value = results.filter((item) => item.status === 'fulfilled').map((item) => item.value);
+  const ticket = activeProfileTicket;
+  if (!isCurrentProfile(ticket)) return;
+  const ids = [...userStore.favoriteShopIds];
+  loadingFavorites.value = true;
+  favoriteLoadError.value = '';
+  try {
+    const result = await fetchFavoriteShops(ids, (shopId) => shopApi.getDetail(shopId));
+    if (!isCurrentProfile(ticket)) return;
+    favoriteShops.value = result.shops;
+    if (result.failedCount) {
+      favoriteLoadError.value = result.shops.length
+        ? `${result.failedCount} 家收藏店铺暂时无法加载，其他店铺仍可查看`
+        : '收藏店铺加载失败，请检查网络后重试';
+    }
+  } catch (error) {
+    if (isCurrentProfile(ticket)) {
+      favoriteLoadError.value = error?.message || '收藏店铺加载失败，请重试';
+    }
+  } finally {
+    if (isCurrentProfile(ticket)) loadingFavorites.value = false;
+  }
 }
 
 function removeFavorite(shopId) {
-  userStore.toggleFavorite(shopId);
-  favoriteShops.value = favoriteShops.value.filter((item) => Number(item.id) !== Number(shopId));
-  ElMessage.success('已取消收藏');
+  try {
+    userStore.toggleFavorite(shopId);
+    favoriteShops.value = favoriteShops.value.filter((item) => Number(item.id) !== Number(shopId));
+    if (!favoriteShops.value.length && !userStore.favoriteShopIds.length) favoriteLoadError.value = '';
+    ElMessage.success('已取消收藏');
+  } catch (error) {
+    ElMessage.error(error?.message || '收藏保存失败，请检查浏览器存储空间');
+  }
+}
+
+function clearFavorites() {
+  try {
+    userStore.clearFavorites();
+    favoriteShops.value = [];
+    favoriteLoadError.value = '';
+    ElMessage.success('已清空收藏');
+  } catch (error) {
+    ElMessage.error(error?.message || '收藏保存失败，请检查浏览器存储空间');
+  }
 }
 
 function removeOrder(orderId) {
@@ -333,12 +589,30 @@ function removeOrder(orderId) {
 }
 
 async function refreshOrderStatus(order) {
+  const ticket = activeProfileTicket;
+  if (!isCurrentProfile(ticket)) return;
+  const orderId = String(order.orderId);
+  const nextRefreshingIds = beginOrderStatusRefresh(refreshingOrderIds.value, orderId);
+  if (!nextRefreshingIds) return;
+  refreshingOrderIds.value = nextRefreshingIds;
   try {
-    const status = await paymentApi.status(order.orderId);
-    userStore.updateOrder(order.orderId, { status: Number(status) });
+    const status = await paymentApi.status(orderId);
+    if (!isCurrentProfile(ticket)) return;
+    if (Number(status) === 0) {
+      userStore.updateOrder(orderId, { creationPending: true });
+      ElMessage.info('订单仍在排队创建，请稍后再次刷新');
+      return;
+    }
+    userStore.updateOrder(orderId, { status: Number(status), creationPending: false });
     ElMessage.success(`订单状态：${formatOrderStatus(status)}`);
   } catch (error) {
-    ElMessage.error(error?.message || '刷新订单状态失败');
+    if (isCurrentProfile(ticket)) {
+      ElMessage.error(error?.message || '刷新订单状态失败');
+    }
+  } finally {
+    if (isCurrentProfile(ticket)) {
+      refreshingOrderIds.value = endOrderStatusRefresh(refreshingOrderIds.value, orderId);
+    }
   }
 }
 
@@ -347,11 +621,24 @@ function saveAddress() {
     ElMessage.warning('请先输入详细地址');
     return;
   }
-  userStore.addAddress({ city: userStore.city, contact: addressForm.contact, phone: addressForm.phone, detail: addressForm.detail });
-  addressForm.contact = '';
-  addressForm.phone = '';
-  addressForm.detail = '';
-  ElMessage.success('地址已保存');
+  try {
+    userStore.addAddress({ city: userStore.city, contact: addressForm.contact, phone: addressForm.phone, detail: addressForm.detail });
+    addressForm.contact = '';
+    addressForm.phone = '';
+    addressForm.detail = '';
+    ElMessage.success('地址已保存');
+  } catch (error) {
+    ElMessage.error(error?.message || '地址保存失败，请检查浏览器存储空间');
+  }
+}
+
+function removeAddress(addressId) {
+  try {
+    userStore.removeAddress(addressId);
+    ElMessage.success('地址已删除');
+  } catch (error) {
+    ElMessage.error(error?.message || '地址删除失败，请检查浏览器存储空间');
+  }
 }
 
 function clearAiHistory() {
@@ -360,10 +647,17 @@ function clearAiHistory() {
 }
 
 async function publishBlog() {
+  if (!/^\d+$/.test(blogForm.shopId.trim()) || Number(blogForm.shopId) <= 0) {
+    ElMessage.warning('请填写有效的店铺 ID');
+    return;
+  }
   if (!blogForm.title.trim() || !blogForm.content.trim()) {
     ElMessage.warning('请先填写标题和内容');
     return;
   }
+  const ticket = activeProfileTicket;
+  if (!isCurrentProfile(ticket)) return;
+  const authToken = userStore.token;
   publishing.value = true;
   try {
     await blogApi.create({
@@ -371,23 +665,104 @@ async function publishBlog() {
       title: blogForm.title,
       images: blogForm.images,
       content: blogForm.content
-    });
+    }, authToken);
+    if (!isCurrentProfile(ticket)) return;
     ElMessage.success('笔记发布成功');
+    await resetBlogForm(true);
+    if (!isCurrentProfile(ticket)) return;
     dialogs.publish = false;
-    resetBlogForm();
-    await loadProfile();
+    await loadMyBlogs();
   } catch (error) {
-    ElMessage.error(error?.message || '发布笔记失败');
+    if (isCurrentProfile(ticket)) ElMessage.error(error?.message || '发布笔记失败');
   } finally {
-    publishing.value = false;
+    if (isCurrentProfile(ticket)) publishing.value = false;
   }
 }
 
-function resetBlogForm() {
+async function uploadBlogImages(event) {
+  const ticket = activeProfileTicket;
+  const authToken = userStore.token;
+  if (!isCurrentProfile(ticket)) return;
+  const selectedFiles = Array.from(event.target.files || []);
+  event.target.value = '';
+  if (!selectedFiles.length) return;
+
+  const files = selectedFiles.filter((file) => file.size <= MAX_BLOG_IMAGE_SIZE_BYTES);
+  if (files.length < selectedFiles.length) {
+    ElMessage.warning('已跳过超过 8 MiB 的图片');
+  }
+  if (!files.length) return;
+
+  if (blogForm.images.trim() && uploadedBlogImages.value.length === 0) {
+    ElMessage.warning('请先清空手动填写的图片地址，再上传图片');
+    return;
+  }
+
+  const availableSlots = 9 - blogImageList.value.length;
+  if (availableSlots <= 0) {
+    ElMessage.warning('一篇笔记最多上传 9 张图片');
+    return;
+  }
+  if (files.length > availableSlots) {
+    ElMessage.warning(`最多还能上传 ${availableSlots} 张图片`);
+  }
+
+  uploadingImages.value = true;
+  try {
+    for (const file of files.slice(0, availableSlots)) {
+      const filename = await blogApi.uploadImage(file, authToken);
+      if (!isCurrentProfile(ticket)) {
+        const failedCount = await deleteStagedBlogImages([String(filename)], authToken);
+        if (failedCount) console.warn('Could not remove a blog image uploaded by a previous account');
+        return;
+      }
+      uploadedBlogImages.value.push(String(filename));
+      blogForm.images = mergeUploadedBlogImages(blogForm.images, String(filename));
+    }
+    ElMessage.success('图片上传完成');
+  } catch (error) {
+    if (isCurrentProfile(ticket)) {
+      ElMessage.error(error?.message || '图片上传失败，已成功上传的图片已保留');
+    }
+  } finally {
+    if (isCurrentProfile(ticket)) uploadingImages.value = false;
+  }
+}
+
+function handlePublishDialogClose() {
+  void resetBlogForm();
+}
+
+function guardPublishDialogClose(done) {
+  if (!uploadingImages.value && !publishing.value) {
+    done();
+  }
+}
+
+async function resetBlogForm(preserveUploaded = false) {
+  const stagedImages = uploadedBlogImages.value;
+  const ownerToken = userStore.token;
+  uploadedBlogImages.value = [];
+  clearBlogFormFields();
+  if (!preserveUploaded && stagedImages.length) {
+    const failedCount = await deleteStagedBlogImages(stagedImages, ownerToken);
+    if (failedCount && userStore.token === ownerToken) {
+      ElMessage.warning(`${failedCount} 张未发布图片暂时未能清理`);
+    }
+  }
+}
+
+function clearBlogFormFields() {
   blogForm.shopId = '';
   blogForm.title = '';
   blogForm.images = '';
   blogForm.content = '';
+}
+
+async function deleteStagedBlogImages(images, authToken) {
+  const results = await Promise.allSettled(images.map((image) => blogApi.deleteImage(image, authToken)));
+  return results.filter((result) => result.status === 'rejected'
+    || result.value?.success === false).length;
 }
 
 function viewBlog(blog) {
@@ -398,7 +773,7 @@ function viewBlog(blog) {
 function goShop(shopId) {
   dialogs.favorites = false;
   dialogs.orders = false;
-  dialogs.reviews = false;
+  dialogs.blogs = false;
   blogDetailVisible.value = false;
   router.push(`/shop/${shopId}`);
 }
@@ -489,6 +864,10 @@ function formatTime(value) {
 .detail-footer-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .address-form,
 .publish-form { display: grid; gap: 12px; }
+.blog-image-upload { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.blog-image-upload input { max-width: 100%; }
+.uploaded-image-list { display: flex; flex-wrap: wrap; gap: 10px; }
+.uploaded-image-list img { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; }
 .compact-top { margin-top: 16px; }
 .support-box { display: grid; gap: 10px; color: #555; line-height: 1.7; }
 .dialog-header h3 { margin: 0 0 8px; font-size: 22px; }

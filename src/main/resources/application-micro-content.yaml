@@ -1,0 +1,32 @@
+server:
+  port: 8082
+spring:
+  servlet:
+    multipart:
+      max-file-size: 8MB
+      max-request-size: 10MB
+  web:
+    resources:
+      static-locations: classpath:/static/,file:${CITYAI_UPLOAD_DIR:/data/imgs}/
+  autoconfigure:
+    exclude:
+      - org.apache.rocketmq.spring.autoconfigure.RocketMQAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiChatAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiEmbeddingAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiImageAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioSpeechAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioTranscriptionAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiModerationAutoConfiguration
+      - org.springframework.ai.vectorstore.milvus.autoconfigure.MilvusVectorStoreAutoConfiguration
+  application:
+    name: cityai-content
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/hmdp_content?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+cityai:
+  upload-dir: ${CITYAI_UPLOAD_DIR:/data/imgs}
+  internal:
+    token: ${CITYAI_INTERNAL_TOKEN}

@@ -1,5 +1,6 @@
 package com.hmdp.ai.controller;
 
+import com.hmdp.config.AdminApiGuard;
 import com.hmdp.ai.dto.AgentChatRequest;
 import com.hmdp.ai.dto.AgentRecommendRequest;
 import com.hmdp.ai.dto.AgentRecommendResponse;
@@ -17,6 +18,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -30,6 +32,7 @@ import java.util.concurrent.TimeUnit;
 public class AiAgentController {
 
     private final AiAgentService aiAgentService;
+    private final AdminApiGuard adminApiGuard;
 
     @SlidingWindowLimit(keySpEL = "'ai-create-conversation'", windowSize = 1, timeUnit = TimeUnit.MINUTES, maxRequests = 20)
     @PostMapping("/conversations")
@@ -86,13 +89,16 @@ public class AiAgentController {
 
     @SlidingWindowLimit(keySpEL = "'ai-index-all'", windowSize = 10, timeUnit = TimeUnit.MINUTES, maxRequests = 2)
     @PostMapping("/index/rebuild/all")
-    public IndexRebuildResponse rebuildAll() {
+    public IndexRebuildResponse rebuildAll(@RequestHeader("X-Admin-Token") String token) {
+        adminApiGuard.verify(token);
         return aiAgentService.rebuildAll();
     }
 
     @SlidingWindowLimit(keySpEL = "#shopId", windowSize = 10, timeUnit = TimeUnit.MINUTES, maxRequests = 3)
     @PostMapping("/index/rebuild/shop/{shopId}")
-    public IndexRebuildResponse rebuildShop(@PathVariable("shopId") Long shopId) {
+    public IndexRebuildResponse rebuildShop(@PathVariable("shopId") Long shopId,
+            @RequestHeader("X-Admin-Token") String token) {
+        adminApiGuard.verify(token);
         return aiAgentService.rebuildShop(shopId);
     }
 }

@@ -17,7 +17,7 @@ import jakarta.annotation.Resource;
  */
 @RestController
 @RequestMapping("/follow")
-@SlidingWindowLimit(globalLimit = true)
+
 public class FollowController {
 
     @Resource

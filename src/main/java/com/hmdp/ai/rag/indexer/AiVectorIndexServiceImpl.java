@@ -1,24 +1,39 @@
 package com.hmdp.ai.rag.indexer;
 
+import com.hmdp.ai.config.AiDependencyGuard;
 import com.hmdp.ai.dto.IndexRebuildResponse;
 import com.hmdp.ai.rag.AiMetadataConstants;
 import com.hmdp.ai.rag.retriever.AiRagRetriever;
+import com.hmdp.client.ContentCatalog;
 import com.hmdp.entity.Blog;
 import com.hmdp.entity.Shop;
-import com.hmdp.service.IBlogService;
-import com.hmdp.service.IShopService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.reader.TextReader;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.server.ResponseStatusException;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -34,6 +49,9 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class AiVectorIndexServiceImpl implements AiVectorIndexService {
 
+    private static final int INDEX_BATCH_SIZE = 200;
+    private static final String INDEX_REBUILD_LOCK = "lock:ai:vector-index";
+
     @Qualifier("knowledgeVectorStore")
     private final VectorStore knowledgeVectorStore;
 
@@ -43,16 +61,21 @@ public class AiVectorIndexServiceImpl implements AiVectorIndexService {
     @Qualifier("blogReviewVectorStore")
     private final VectorStore blogReviewVectorStore;
 
-    private final IShopService shopService;
-
-    private final IBlogService blogService;
+    private final ContentCatalog contentCatalog;
 
     private final AiRagRetriever aiRagRetriever;
+
+    @Autowired
+    private RedissonClient redissonClient;
 
     private final TokenTextSplitter tokenTextSplitter = new TokenTextSplitter();
 
     @Override
     public IndexRebuildResponse rebuildAll() {
+        return withIndexLock(this::rebuildAllLocked);
+    }
+
+    private IndexRebuildResponse rebuildAllLocked() {
         IndexRebuildResponse response = new IndexRebuildResponse();
         response.setScope("all");
         response.setKnowledgeCount(rebuildKnowledge());
@@ -65,6 +88,10 @@ public class AiVectorIndexServiceImpl implements AiVectorIndexService {
 
     @Override
     public IndexRebuildResponse rebuildShop(Long shopId) {
+        return withIndexLock(() -> rebuildShopLocked(shopId));
+    }
+
+    private IndexRebuildResponse rebuildShopLocked(Long shopId) {
         IndexRebuildResponse response = new IndexRebuildResponse();
         response.setScope("shop:" + shopId);
         response.setKnowledgeCount(0);
@@ -77,22 +104,40 @@ public class AiVectorIndexServiceImpl implements AiVectorIndexService {
 
     @Override
     public int rebuildKnowledge() {
+        return withIndexLock(this::rebuildKnowledgeLocked);
+    }
+
+    private int rebuildKnowledgeLocked() {
+        Filter.Expression filter = new FilterExpressionBuilder()
+                .eq(AiMetadataConstants.DOC_TYPE, AiMetadataConstants.DOC_TYPE_KNOWLEDGE).build();
+        boolean replacementStarted = false;
         try {
-            knowledgeVectorStore.delete(new FilterExpressionBuilder().eq(AiMetadataConstants.DOC_TYPE, AiMetadataConstants.DOC_TYPE_KNOWLEDGE).build());
             List<Document> documents = loadKnowledgeDocuments();
+            replacementStarted = true;
+            indexVectorStore(() -> knowledgeVectorStore.delete(filter));
             if (!documents.isEmpty()) {
-                knowledgeVectorStore.add(documents);
+                indexVectorStore(() -> knowledgeVectorStore.add(documents));
             }
             return documents.size();
         }
         catch (Exception e) {
             log.error("Failed to rebuild knowledge vector store", e);
+            if (replacementStarted) {
+                clearPartialIndex(knowledgeVectorStore, filter, e);
+            }
             throw new IllegalStateException("重建知识库索引失败", e);
         }
     }
 
     @Override
     public void ensureInitialized() {
+        withIndexLock(() -> {
+            ensureInitializedLocked();
+            return null;
+        });
+    }
+
+    private void ensureInitializedLocked() {
         // 启动时只做“缺啥补啥”，避免每次启动都全量重建索引。
         if (!aiRagRetriever.hasKnowledgeDocuments()) {
             rebuildKnowledge();
@@ -105,43 +150,259 @@ public class AiVectorIndexServiceImpl implements AiVectorIndexService {
         }
     }
 
-    private int rebuildAllShopProfiles() {
-        shopProfileVectorStore.delete(new FilterExpressionBuilder().eq(AiMetadataConstants.DOC_TYPE, AiMetadataConstants.DOC_TYPE_SHOP_PROFILE).build());
-        List<Shop> shops = shopService.list();
-        List<Document> documents = shops.stream().map(this::toShopProfileDocument).toList();
-        if (!documents.isEmpty()) {
-            shopProfileVectorStore.add(documents);
+    private <T> T withIndexLock(java.util.function.Supplier<T> operation) {
+        RLock lock = redissonClient.getLock(INDEX_REBUILD_LOCK);
+        boolean acquired;
+        try {
+            acquired = lock.tryLock();
+        } catch (RuntimeException lockFailure) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "AI 索引锁服务暂不可用", lockFailure);
         }
-        return documents.size();
+        if (!acquired) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "AI 索引重建正在进行，请稍后重试");
+        }
+        try {
+            return operation.get();
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+
+    private int rebuildAllShopProfiles() {
+        Filter.Expression filter = new FilterExpressionBuilder()
+                .eq(AiMetadataConstants.DOC_TYPE, AiMetadataConstants.DOC_TYPE_SHOP_PROFILE).build();
+        Path stagedDocuments = null;
+        boolean replacementStarted = false;
+        try {
+            stagedDocuments = Files.createTempFile("cityai-shop-profile-index-", ".bin");
+            int count = stageAllShopProfileDocuments(stagedDocuments);
+            replacementStarted = true;
+            indexVectorStore(() -> shopProfileVectorStore.delete(filter));
+            writeStagedDocuments(stagedDocuments, shopProfileVectorStore);
+            return count;
+        } catch (RuntimeException e) {
+            if (replacementStarted) {
+                clearPartialIndex(shopProfileVectorStore, filter, e);
+            }
+            throw e;
+        } catch (IOException | ClassNotFoundException e) {
+            if (replacementStarted) {
+                clearPartialIndex(shopProfileVectorStore, filter, e);
+            }
+            throw new IllegalStateException("店铺画像索引暂存或写入失败", e);
+        } finally {
+            deleteStagedDocuments(stagedDocuments);
+        }
     }
 
     private int rebuildSingleShopProfile(Long shopId) {
-        shopProfileVectorStore.delete(new FilterExpressionBuilder().eq(AiMetadataConstants.SHOP_ID, shopId).build());
-        Shop shop = shopService.getById(shopId);
-        if (shop == null) {
-            return 0;
+        Filter.Expression filter = new FilterExpressionBuilder().eq(AiMetadataConstants.SHOP_ID, shopId).build();
+        // Read the source before deleting the current profile so a Content service failure preserves old data.
+        Shop shop = contentCatalog.shop(shopId);
+        try {
+            indexVectorStore(() -> shopProfileVectorStore.delete(filter));
+            if (shop == null) {
+                return 0;
+            }
+            List<Document> documents = List.of(toShopProfileDocument(shop));
+            indexVectorStore(() -> shopProfileVectorStore.add(documents));
+            return 1;
+        } catch (RuntimeException e) {
+            clearPartialIndex(shopProfileVectorStore, filter, e);
+            throw e;
         }
-        shopProfileVectorStore.add(List.of(toShopProfileDocument(shop)));
-        return 1;
     }
 
     private int rebuildAllBlogReviews() {
-        blogReviewVectorStore.delete(new FilterExpressionBuilder().eq(AiMetadataConstants.DOC_TYPE, AiMetadataConstants.DOC_TYPE_BLOG_REVIEW).build());
-        List<Document> documents = buildBlogDocuments(blogService.list());
-        if (!documents.isEmpty()) {
-            blogReviewVectorStore.add(documents);
+        Filter.Expression filter = new FilterExpressionBuilder()
+                .eq(AiMetadataConstants.DOC_TYPE, AiMetadataConstants.DOC_TYPE_BLOG_REVIEW).build();
+        Path stagedDocuments = null;
+        boolean replacementStarted = false;
+        try {
+            stagedDocuments = Files.createTempFile("cityai-blog-review-index-", ".bin");
+            int count = stageAllBlogReviewDocuments(stagedDocuments);
+            replacementStarted = true;
+            indexVectorStore(() -> blogReviewVectorStore.delete(filter));
+            writeStagedDocuments(stagedDocuments, blogReviewVectorStore);
+            return count;
+        } catch (RuntimeException e) {
+            if (replacementStarted) {
+                clearPartialIndex(blogReviewVectorStore, filter, e);
+            }
+            throw e;
+        } catch (IOException | ClassNotFoundException e) {
+            if (replacementStarted) {
+                clearPartialIndex(blogReviewVectorStore, filter, e);
+            }
+            throw new IllegalStateException("评论索引暂存或写入失败", e);
+        } finally {
+            deleteStagedDocuments(stagedDocuments);
         }
-        return documents.size();
+    }
+
+    private int stageAllShopProfileDocuments(Path stagedDocuments) throws IOException {
+        int count = 0;
+        long afterId = 0;
+        try (ObjectOutputStream output = new ObjectOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(stagedDocuments)))) {
+            List<Shop> shops;
+            do {
+                shops = contentCatalog.shopsAfter(afterId, INDEX_BATCH_SIZE);
+                for (Shop shop : shops) {
+                    Document document = toShopProfileDocument(shop);
+                    output.writeObject(new StagedDocument(document.getId(), document.getText(),
+                            new HashMap<>(document.getMetadata())));
+                    count++;
+                }
+                if (!shops.isEmpty()) {
+                    afterId = shops.get(shops.size() - 1).getId();
+                }
+            } while (shops.size() == INDEX_BATCH_SIZE);
+        }
+        return count;
+    }
+
+    private int stageAllBlogReviewDocuments(Path stagedDocuments) throws IOException {
+        int count = 0;
+        long afterId = 0;
+        try (ObjectOutputStream output = new ObjectOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(stagedDocuments)))) {
+            List<Blog> blogs;
+            do {
+                blogs = contentCatalog.blogsAfter(afterId, INDEX_BATCH_SIZE);
+                for (Document document : buildBlogDocuments(blogs)) {
+                    output.writeObject(new StagedDocument(document.getId(), document.getText(),
+                            new HashMap<>(document.getMetadata())));
+                    count++;
+                }
+                if (!blogs.isEmpty()) {
+                    afterId = blogs.get(blogs.size() - 1).getId();
+                }
+            } while (blogs.size() == INDEX_BATCH_SIZE);
+        }
+        return count;
     }
 
     private int rebuildShopBlogReviews(Long shopId) {
-        blogReviewVectorStore.delete(new FilterExpressionBuilder().eq(AiMetadataConstants.SHOP_ID, shopId).build());
-        List<Blog> blogs = blogService.lambdaQuery().eq(Blog::getShopId, shopId).list();
-        List<Document> documents = buildBlogDocuments(blogs);
-        if (!documents.isEmpty()) {
-            blogReviewVectorStore.add(documents);
+        Filter.Expression filter = new FilterExpressionBuilder().eq(AiMetadataConstants.SHOP_ID, shopId).build();
+        Path stagedDocuments = null;
+        boolean replacementStarted = false;
+        try {
+            stagedDocuments = Files.createTempFile("cityai-shop-blog-index-", ".bin");
+            int count = stageShopBlogDocuments(shopId, stagedDocuments);
+            // Complete the bounded-memory content scan before removing the currently searchable documents.
+            replacementStarted = true;
+            indexVectorStore(() -> blogReviewVectorStore.delete(filter));
+            writeStagedShopBlogDocuments(stagedDocuments);
+            return count;
+        } catch (RuntimeException e) {
+            if (replacementStarted) {
+                clearPartialIndex(blogReviewVectorStore, filter, e);
+            }
+            throw e;
+        } catch (IOException | ClassNotFoundException e) {
+            if (replacementStarted) {
+                clearPartialIndex(blogReviewVectorStore, filter, e);
+            }
+            throw new IllegalStateException("店铺评论索引暂存或写入失败", e);
+        } finally {
+            if (stagedDocuments != null) {
+                try {
+                    Files.deleteIfExists(stagedDocuments);
+                } catch (IOException e) {
+                    log.warn("无法删除店铺评论索引暂存文件: {}", stagedDocuments, e);
+                }
+            }
         }
-        return documents.size();
+    }
+
+    private int stageShopBlogDocuments(Long shopId, Path stagedDocuments) throws IOException {
+        int count = 0;
+        long afterId = 0;
+        try (ObjectOutputStream output = new ObjectOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(stagedDocuments)))) {
+            List<Blog> blogs;
+            do {
+                blogs = contentCatalog.blogsForShopAfter(shopId, afterId, INDEX_BATCH_SIZE);
+                for (Document document : buildBlogDocuments(blogs)) {
+                    output.writeObject(new StagedDocument(document.getId(), document.getText(),
+                            new HashMap<>(document.getMetadata())));
+                    count++;
+                }
+                if (!blogs.isEmpty()) {
+                    afterId = blogs.get(blogs.size() - 1).getId();
+                }
+            } while (blogs.size() == INDEX_BATCH_SIZE);
+        }
+        return count;
+    }
+
+    private void writeStagedShopBlogDocuments(Path stagedDocuments)
+            throws IOException, ClassNotFoundException {
+        writeStagedDocuments(stagedDocuments, blogReviewVectorStore);
+    }
+
+    private void writeStagedDocuments(Path stagedDocuments, VectorStore vectorStore)
+            throws IOException, ClassNotFoundException {
+        try (ObjectInputStream input = new ObjectInputStream(
+                new BufferedInputStream(Files.newInputStream(stagedDocuments)))) {
+            List<Document> batch = new ArrayList<>(INDEX_BATCH_SIZE);
+            while (true) {
+                StagedDocument staged;
+                try {
+                    staged = (StagedDocument) input.readObject();
+                } catch (EOFException endOfFile) {
+                    break;
+                }
+                batch.add(new Document(staged.id(), staged.text(), staged.metadata()));
+                if (batch.size() == INDEX_BATCH_SIZE) {
+                    addBatch(vectorStore, batch);
+                    batch = new ArrayList<>(INDEX_BATCH_SIZE);
+                }
+            }
+            if (!batch.isEmpty()) {
+                addBatch(vectorStore, batch);
+            }
+        }
+    }
+
+    private void addBatch(VectorStore vectorStore, List<Document> documents) {
+        indexVectorStore(() -> vectorStore.add(documents));
+    }
+
+    private void addBlogBatch(List<Document> documents) {
+        addBatch(blogReviewVectorStore, documents);
+    }
+
+    private void deleteStagedDocuments(Path stagedDocuments) {
+        if (stagedDocuments == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(stagedDocuments);
+        } catch (IOException e) {
+            log.warn("无法删除向量索引暂存文件: {}", stagedDocuments, e);
+        }
+    }
+
+    private void clearPartialIndex(VectorStore vectorStore, Filter.Expression filter, Exception failure) {
+        try {
+            indexVectorStore(() -> vectorStore.delete(filter));
+        } catch (RuntimeException cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
+            log.error("Failed to clear partially rebuilt vector index", cleanupFailure);
+        }
+    }
+
+    private void indexVectorStore(Runnable operation) {
+        AiDependencyGuard.callUnchecked("ai:rag:index", () -> {
+            operation.run();
+            return null;
+        });
     }
 
     private List<Document> loadKnowledgeDocuments() throws Exception {
@@ -216,7 +477,9 @@ public class AiVectorIndexServiceImpl implements AiVectorIndexService {
             return List.of();
         }
         // 评论向量不只存正文，还补上标题和店铺名，降低纯正文短评的语义损失。
-        Map<Long, Shop> shopMap = shopService.list().stream().collect(Collectors.toMap(Shop::getId, shop -> shop));
+        List<Long> shopIds = blogs.stream().map(Blog::getShopId).filter(id -> id != null).distinct().toList();
+        Map<Long, Shop> shopMap = contentCatalog.shopsByIds(shopIds).stream()
+                .collect(Collectors.toMap(Shop::getId, shop -> shop));
         List<Document> documents = new ArrayList<>(blogs.size());
         for (Blog blog : blogs) {
             Shop shop = shopMap.get(blog.getShopId());
@@ -245,5 +508,10 @@ public class AiVectorIndexServiceImpl implements AiVectorIndexService {
 
     private String defaultString(String value) {
         return value == null ? "" : value;
+    }
+
+    private record StagedDocument(String id, String text, Map<String, Object> metadata)
+            implements Serializable {
+        private static final long serialVersionUID = 1L;
     }
 }

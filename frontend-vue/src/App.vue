@@ -11,24 +11,40 @@
 </template>
 
 <script setup>
+import { watch } from 'vue';
+import { ElMessage } from 'element-plus';
 import AiAssistantDrawer from '@/components/ai/AiAssistantDrawer.vue';
 import LoginDialog from '@/components/auth/LoginDialog.vue';
+import { useAiStore } from '@/store/ai';
 import { useUserStore } from '@/store/user';
 
 const userStore = useUserStore();
+const aiStore = useAiStore();
+
+watch(
+  () => userStore.token,
+  () => aiStore.syncSessionScope(),
+  { immediate: true }
+);
 
 onMounted(async () => {
-  await userStore.initAuth();
   window.addEventListener('hm-auth-expired', handleAuthExpired);
+  window.addEventListener('hm-auth-check-unavailable', handleAuthCheckUnavailable);
+  await userStore.initAuth();
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener('hm-auth-expired', handleAuthExpired);
+  window.removeEventListener('hm-auth-check-unavailable', handleAuthCheckUnavailable);
 });
 
 function handleAuthExpired() {
   userStore.clearAuth();
   userStore.openLoginDialog();
+}
+
+function handleAuthCheckUnavailable() {
+  ElMessage.warning('暂时无法验证登录状态，网络恢复后可刷新页面重试');
 }
 </script>
 

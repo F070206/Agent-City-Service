@@ -1,0 +1,16 @@
+.git
+.idea
+.codex
+.agents
+target
+**/target
+**/node_modules
+frontend-vue
+docs
+start.local.json
+chat-history.json
+chat-memory.json
+chat-pdf.json
+chat-pdf.properties
+.env
+.env.*

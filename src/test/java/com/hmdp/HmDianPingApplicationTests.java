@@ -12,6 +12,7 @@ import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.SnowflakeIdWorker;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.data.geo.Point;
 import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -34,6 +35,7 @@ import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
 import static com.hmdp.utils.RedisConstants.SHOP_GEO_KEY;
 import cn.hutool.core.lang.UUID;
 @SpringBootTest
+@EnabledIfEnvironmentVariable(named = "CITYAI_RUN_LEGACY_INTEGRATION_TESTS", matches = "true")
 class HmDianPingApplicationTests {
 
     @Resource

@@ -9,19 +9,29 @@ import java.util.concurrent.locks.ReentrantLock;
 @Component
 public class ConversationExecutionCoordinator {
 
-    private final ConcurrentMap<Long, ReentrantLock> locks = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, LockState> locks = new ConcurrentHashMap<>();
 
     public void runSerial(Long conversationId, Runnable task) {
-        ReentrantLock lock = locks.computeIfAbsent(conversationId, ignored -> new ReentrantLock());
-        lock.lock();
+        LockState state = locks.compute(conversationId, (ignored, current) -> {
+            LockState selected = current == null ? new LockState() : current;
+            selected.users++;
+            return selected;
+        });
+        state.lock.lock();
         try {
             task.run();
         }
         finally {
-            lock.unlock();
-            if (!lock.hasQueuedThreads()) {
-                locks.remove(conversationId, lock);
-            }
+            state.lock.unlock();
+            locks.computeIfPresent(conversationId, (ignored, current) -> {
+                current.users--;
+                return current.users == 0 ? null : current;
+            });
         }
+    }
+
+    private static final class LockState {
+        private final ReentrantLock lock = new ReentrantLock(true);
+        private int users;
     }
 }

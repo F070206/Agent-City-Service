@@ -1,6 +1,5 @@
-﻿import { categoryList, shops as mockShops } from '@/mock/data';
+import { categoryList } from '@/mock/data';
 
-const mockShopMap = new Map(mockShops.map((shop) => [Number(shop.id), shop]));
 
 function fallbackCategoryMeta(name = '', index = 0) {
   const preset = categoryList.find((item) => name.includes(item.name) || item.name.includes(name));
@@ -24,31 +23,30 @@ export function normalizeCategories(list = []) {
 
 export function normalizeShop(raw) {
   const shopId = Number(raw?.id);
-  const mock = mockShopMap.get(shopId) || {};
   const firstImage = raw?.images?.split(',')?.map((item) => item.trim())?.find(Boolean);
-  const normalizedScore = raw?.score == null ? mock.score || 4.5 : Number(raw.score) > 5 ? Number(raw.score) / 10 : Number(raw.score);
-  const distanceValue = raw?.distance == null ? mock.distance || '附近' : formatDistance(raw.distance);
+  const normalizedScore = raw?.score == null ? null : Number(raw.score) > 5 ? Number(raw.score) / 10 : Number(raw.score);
+  const distanceValue = raw?.distance == null ? '距离未知' : formatDistance(raw.distance);
 
   return {
     id: shopId,
-    typeId: Number(raw?.typeId || mock.typeId || 0),
-    category: mock.category || '',
-    name: raw?.name || mock.name || '未命名商铺',
-    score: Number(Number(normalizedScore).toFixed(1)),
-    price: Number(raw?.avgPrice ?? mock.price ?? 0),
+    typeId: Number(raw?.typeId || 0),
+    category: '',
+    name: raw?.name || '未命名商铺',
+    score: normalizedScore == null ? null : Number(normalizedScore.toFixed(1)),
+    price: Number(raw?.avgPrice ?? raw?.price ?? 0),
     distance: distanceValue,
-    tags: mock.tags || [raw?.area, raw?.openHours].filter(Boolean),
-    cover: normalizeImage(firstImage) || mock.cover,
-    status: mock.status || '营业中',
-    phone: mock.phone || '暂未提供',
-    address: raw?.address || mock.address || '暂无地址',
-    recommendText: mock.recommendText || buildRecommendText(raw),
-    dishes: mock.dishes || [],
-    offers: mock.offers || [],
-    comments: mock.comments || [],
+    tags: [raw?.area, raw?.openHours].filter(Boolean),
+    cover: normalizeImage(firstImage),
+    status: raw?.status || '营业状态未知',
+    phone: raw?.phone || '暂未提供',
+    address: raw?.address || '暂无地址',
+    recommendText: raw?.recommendText || buildRecommendText(raw),
+    dishes: Array.isArray(raw?.dishes) ? raw.dishes : [],
+    offers: Array.isArray(raw?.offers) ? raw.offers : [],
+    comments: Array.isArray(raw?.commentList) ? raw.commentList : [],
     sold: Number(raw?.sold || 0),
-    commentCount: Number(raw?.comments || mock.comments?.length || 0),
-    openHours: raw?.openHours || mock.openHours || '营业时间以门店为准',
+    commentCount: Number(raw?.comments ?? raw?.commentCount ?? 0),
+    openHours: raw?.openHours || '营业时间以门店为准',
     raw
   };
 }
@@ -79,7 +77,8 @@ function formatDistance(distance) {
 }
 
 function buildRecommendText(raw) {
-  const sold = raw?.sold ? `销量 ${raw.sold}` : '口碑不错';
-  const comments = raw?.comments ? `评论 ${raw.comments}` : '适合打卡';
-  return `${sold}，${comments}，值得一试。`;
+  const facts = [];
+  if (raw?.sold != null) facts.push(`销量 ${raw.sold}`);
+  if (raw?.comments != null) facts.push(`评论 ${raw.comments}`);
+  return facts.length ? facts.join('，') : '暂无商家介绍';
 }

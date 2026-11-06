@@ -5,8 +5,8 @@ import { useUserStore } from '@/store/user';
 
 const AI_STORAGE_KEY = 'hm-dianping-ai-store';
 
-function resolveAiStorageKey() {
-  return `${AI_STORAGE_KEY}:${localStorage.getItem('hm-dianping-token') || 'guest'}`;
+function resolveAiStorageKey(token = localStorage.getItem('hm-dianping-token')) {
+  return `${AI_STORAGE_KEY}:${token || 'guest'}`;
 }
 const DEFAULT_WELCOME_CONTENT = '你好呀，我是 AI 美食助手。你可以让我推荐附近美食、推荐菜品，或者解答美食问题。';
 const AI_STREAM_WAIT_MS = 75000;
@@ -21,9 +21,9 @@ function createWelcomeMessage() {
   };
 }
 
-function loadPersistedState() {
+function loadPersistedState(token) {
   try {
-    const raw = localStorage.getItem(resolveAiStorageKey());
+    const raw = localStorage.getItem(resolveAiStorageKey(token));
     return raw ? JSON.parse(raw) : null;
   } catch {
     return null;
@@ -32,6 +32,14 @@ function loadPersistedState() {
 
 function wait(duration) {
   return new Promise((resolve) => setTimeout(resolve, duration));
+}
+
+function withTimeout(promise, duration, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), duration);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 function buildPrompt(message, currentShop) {
@@ -130,11 +138,20 @@ function normalizeMessages(messages = []) {
  */
 export const useAiStore = defineStore('ai', {
   state: () => {
-    const persisted = loadPersistedState();
+    const sessionToken = localStorage.getItem('hm-dianping-token') || '';
+    const persisted = loadPersistedState(sessionToken);
     return {
+      sessionToken,
+      sessionVersion: 0,
       drawerVisible: false,
       currentShopContext: null,
       pending: false,
+      conversationSwitchRequestId: 0,
+      conversationSwitchError: '',
+      failedConversationId: null,
+      conversationCreateError: '',
+      conversationCreating: false,
+      conversationListError: '',
       conversationId: persisted?.conversationId || null,
       conversations: [],
       history: persisted?.history?.length ? persisted.history : [createWelcomeMessage()],
@@ -147,7 +164,33 @@ export const useAiStore = defineStore('ai', {
     }
   },
   actions: {
+    syncSessionScope() {
+      const token = localStorage.getItem('hm-dianping-token') || '';
+      if (token === this.sessionToken) return false;
+
+      this.sessionToken = token;
+      this.sessionVersion += 1;
+      this.conversationSwitchRequestId += 1;
+      const persisted = loadPersistedState(token);
+      this.conversationId = persisted?.conversationId || null;
+      this.history = Array.isArray(persisted?.history) && persisted.history.length
+        ? persisted.history
+        : [createWelcomeMessage()];
+      this.mode = persisted?.mode || 'backend';
+      this.conversations = [];
+      this.pending = false;
+      this.conversationCreating = false;
+      this.conversationSwitchError = '';
+      this.failedConversationId = null;
+      this.conversationCreateError = '';
+      this.conversationListError = '';
+      return true;
+    },
+    isSessionCurrent(version) {
+      return version === this.sessionVersion;
+    },
     syncState() {
+      this.syncSessionScope();
       localStorage.setItem(
         resolveAiStorageKey(),
         JSON.stringify({
@@ -158,6 +201,7 @@ export const useAiStore = defineStore('ai', {
       );
     },
     openDrawer() {
+      this.syncSessionScope();
       this.drawerVisible = true;
       void this.bootstrapConversations();
     },
@@ -171,9 +215,11 @@ export const useAiStore = defineStore('ai', {
       this.history.push(message);
       this.syncState();
     },
-    updateMessageContent(messageId, content) {
+    updateMessageContent(messageId, content, persist = true) {
       this.history = this.history.map((item) => (item.id === messageId ? { ...item, content } : item));
-      this.syncState();
+      if (persist) {
+        this.syncState();
+      }
     },
     replaceLoadingMessage(messageId, message) {
       this.history = this.history.filter((item) => item.id !== messageId);
@@ -181,6 +227,10 @@ export const useAiStore = defineStore('ai', {
       this.syncState();
     },
     clearHistory() {
+      if (this.pending) {
+        return;
+      }
+      this.conversationSwitchRequestId += 1;
       this.conversationId = null;
       this.history = [{
         id: Date.now(),
@@ -190,6 +240,7 @@ export const useAiStore = defineStore('ai', {
       this.syncState();
     },
     ensureLoggedIn() {
+      this.syncSessionScope();
       const userStore = useUserStore();
       if (userStore.isLoggedIn) {
         return true;
@@ -203,9 +254,11 @@ export const useAiStore = defineStore('ai', {
       return false;
     },
     async bootstrapConversations() {
+      this.syncSessionScope();
       const userStore = useUserStore();
       if (!userStore.isLoggedIn) {
         this.conversations = [];
+        this.conversationListError = '';
         return;
       }
       await this.loadConversations();
@@ -214,12 +267,24 @@ export const useAiStore = defineStore('ai', {
       }
     },
     async loadConversations() {
+      this.syncSessionScope();
       const userStore = useUserStore();
       if (!userStore.isLoggedIn) {
         this.conversations = [];
+        this.conversationListError = '';
         return [];
       }
-      const list = await aiApi.listConversations().catch(() => []);
+      const sessionVersion = this.sessionVersion;
+      let list;
+      try {
+        list = await aiApi.listConversations();
+      } catch {
+        if (!this.isSessionCurrent(sessionVersion)) return this.conversations;
+        this.conversationListError = '会话列表加载失败，请检查网络后重试';
+        return this.conversations;
+      }
+      if (!this.isSessionCurrent(sessionVersion)) return this.conversations;
+      this.conversationListError = '';
       this.conversations = (list || []).map(normalizeConversation);
       if (this.conversationId && !this.conversations.some((item) => Number(item.id) === Number(this.conversationId))) {
         this.conversationId = null;
@@ -228,22 +293,38 @@ export const useAiStore = defineStore('ai', {
       return this.conversations;
     },
     async startNewConversation() {
+      this.syncSessionScope();
       const userStore = useUserStore();
-      if (this.pending) {
+      if (this.pending || this.conversationCreating) {
         return;
       }
       if (!userStore.isLoggedIn) {
         userStore.openLoginDialog();
         return;
       }
-      const conversation = normalizeConversation(await aiApi.createConversation());
-      this.conversationId = conversation.id;
-      this.history = [createWelcomeMessage()];
-      this.mode = 'backend';
-      this.conversations = [conversation, ...this.conversations.filter((item) => Number(item.id) !== Number(conversation.id))];
-      this.syncState();
+      this.conversationSwitchRequestId += 1;
+      this.conversationCreating = true;
+      this.conversationCreateError = '';
+      const sessionVersion = this.sessionVersion;
+      try {
+        const conversation = normalizeConversation(await aiApi.createConversation());
+        if (!this.isSessionCurrent(sessionVersion)) return;
+        this.conversationId = conversation.id;
+        this.history = [createWelcomeMessage()];
+        this.mode = 'backend';
+        this.conversations = [conversation, ...this.conversations.filter((item) => Number(item.id) !== Number(conversation.id))];
+        this.conversationSwitchError = '';
+        this.failedConversationId = null;
+        this.syncState();
+      } catch (error) {
+        if (!this.isSessionCurrent(sessionVersion)) return;
+        this.conversationCreateError = error?.message || '新建会话失败，请重试';
+      } finally {
+        if (this.isSessionCurrent(sessionVersion)) this.conversationCreating = false;
+      }
     },
     async switchConversation(conversationId, { refreshList = true, silent = false } = {}) {
+      this.syncSessionScope();
       const userStore = useUserStore();
       if (this.pending) {
         return;
@@ -254,7 +335,23 @@ export const useAiStore = defineStore('ai', {
         }
         return;
       }
-      const messages = await aiApi.getMessages(conversationId);
+      const requestId = ++this.conversationSwitchRequestId;
+      const sessionVersion = this.sessionVersion;
+      this.conversationSwitchError = '';
+      this.failedConversationId = null;
+      let messages;
+      try {
+        messages = await aiApi.getMessages(conversationId);
+      } catch (error) {
+        if (requestId === this.conversationSwitchRequestId && this.isSessionCurrent(sessionVersion)) {
+          this.conversationSwitchError = error?.message || '会话内容加载失败，请重试';
+          this.failedConversationId = Number(conversationId);
+        }
+        return;
+      }
+      if (requestId !== this.conversationSwitchRequestId || !this.isSessionCurrent(sessionVersion)) {
+        return;
+      }
       this.conversationId = Number(conversationId);
       this.history = normalizeMessages(messages || []);
       this.mode = 'backend';
@@ -264,10 +361,13 @@ export const useAiStore = defineStore('ai', {
       this.syncState();
     },
     async ensureConversation() {
+      this.syncSessionScope();
       if (this.conversationId) {
         return this.conversationId;
       }
+      const sessionVersion = this.sessionVersion;
       const conversation = normalizeConversation(await aiApi.createConversation());
+      if (!this.isSessionCurrent(sessionVersion)) throw new Error('登录状态已切换，请重试');
       this.conversationId = conversation.id;
       this.conversations = [conversation, ...this.conversations.filter((item) => Number(item.id) !== Number(conversation.id))];
       this.syncState();
@@ -303,6 +403,7 @@ export const useAiStore = defineStore('ai', {
         return;
       }
 
+      const sessionVersion = this.sessionVersion;
       const userStore = useUserStore();
       const finalQuery = query?.trim() || `${userStore.city}附近美食推荐`;
       const loadingId = Date.now() + 1;
@@ -311,8 +412,10 @@ export const useAiStore = defineStore('ai', {
       this.pushMessage({ id: loadingId, role: 'assistant', content: '正在为你检索附近值得去的店铺...' });
 
       try {
-        await wait(AI_POLL_INTERVAL_MS);
+        await wait(1200);
+        if (!this.isSessionCurrent(sessionVersion)) return;
         const result = await aiApi.recommend({ query: finalQuery, topK: 3 });
+        if (!this.isSessionCurrent(sessionVersion)) return;
         this.mode = 'backend';
         const content = [result?.summary, result?.missingInfoNotice].filter(Boolean).join('\n\n') || 'AI 已返回推荐结果。';
         this.replaceLoadingMessage(loadingId, {
@@ -322,12 +425,16 @@ export const useAiStore = defineStore('ai', {
           cards: toRecommendCards(result?.items || [])
         });
       } catch (error) {
+        if (!this.isSessionCurrent(sessionVersion)) return;
         if (!shouldFallbackToMock(error)) {
           this.mode = 'backend';
+          const recoverable = String(error?.message || '').includes('仍在后台处理');
           this.replaceLoadingMessage(loadingId, {
             id: Date.now() + 2,
             role: 'assistant',
-            content: extractErrorMessage(error)
+            content: recoverable
+              ? `${extractErrorMessage(error)}。稍后可重新打开此会话查看最新回复。`
+              : extractErrorMessage(error)
           });
         } else {
           const fallback = buildAiResponse(finalQuery, this.currentShopContext);
@@ -340,8 +447,10 @@ export const useAiStore = defineStore('ai', {
           });
         }
       } finally {
-        this.pending = false;
-        this.syncState();
+        if (this.isSessionCurrent(sessionVersion)) {
+          this.pending = false;
+          this.syncState();
+        }
       }
     },
     async sendShopInsight(shop = this.currentShopContext) {
@@ -352,6 +461,7 @@ export const useAiStore = defineStore('ai', {
         return;
       }
 
+      const sessionVersion = this.sessionVersion;
       const loadingId = Date.now() + 1;
       this.pending = true;
       this.setCurrentShop(shop);
@@ -360,7 +470,9 @@ export const useAiStore = defineStore('ai', {
 
       try {
         await wait(1200);
+        if (!this.isSessionCurrent(sessionVersion)) return;
         const insight = await aiApi.analyzeShop(shop.id);
+        if (!this.isSessionCurrent(sessionVersion)) return;
         this.mode = 'backend';
         this.replaceLoadingMessage(loadingId, {
           id: Date.now() + 2,
@@ -368,6 +480,7 @@ export const useAiStore = defineStore('ai', {
           content: buildInsightReply(shop, insight)
         });
       } catch (error) {
+        if (!this.isSessionCurrent(sessionVersion)) return;
         if (!shouldFallbackToMock(error)) {
           this.mode = 'backend';
           this.replaceLoadingMessage(loadingId, {
@@ -386,8 +499,10 @@ export const useAiStore = defineStore('ai', {
           });
         }
       } finally {
-        this.pending = false;
-        this.syncState();
+        if (this.isSessionCurrent(sessionVersion)) {
+          this.pending = false;
+          this.syncState();
+        }
       }
     },
     async sendMessage(content, extra = {}) {
@@ -399,6 +514,7 @@ export const useAiStore = defineStore('ai', {
         return;
       }
 
+      const sessionVersion = this.sessionVersion;
       this.pending = true;
       this.pushMessage({ id: Date.now(), role: 'user', content: message });
 
@@ -407,10 +523,13 @@ export const useAiStore = defineStore('ai', {
 
       try {
         await wait(1200);
-        const reply = await this.askBackend(message, extra.currentShop || this.currentShopContext, loadingId);
+        if (!this.isSessionCurrent(sessionVersion)) return;
+        const reply = await this.askBackend(message, extra.currentShop || this.currentShopContext, loadingId, sessionVersion);
+        if (!this.isSessionCurrent(sessionVersion)) return;
         this.replaceLoadingMessage(loadingId, reply);
         await this.refreshConversationList();
       } catch (error) {
+        if (!this.isSessionCurrent(sessionVersion)) return;
         if (!shouldFallbackToMock(error)) {
           this.mode = 'backend';
           this.replaceLoadingMessage(loadingId, {
@@ -429,35 +548,53 @@ export const useAiStore = defineStore('ai', {
           });
         }
       } finally {
-        this.pending = false;
-        this.syncState();
+        if (this.isSessionCurrent(sessionVersion)) {
+          this.pending = false;
+          this.syncState();
+        }
       }
     },
-    async askBackend(message, currentShop, loadingId) {
+    async askBackend(message, currentShop, loadingId, sessionVersion = this.sessionVersion) {
       const conversationId = await this.ensureConversation();
-      const beforeMessages = await aiApi.getMessages(conversationId).catch(() => []);
+      if (!this.isSessionCurrent(sessionVersion)) throw new Error('登录状态已切换，请重试');
+      // Polling uses this cursor to distinguish the current reply from previous turns.
+      // If history cannot be read, do not send a request with a zero cursor and risk
+      // returning an old assistant message as the answer to this turn.
+      const beforeMessages = await aiApi.getMessages(conversationId);
+      if (!this.isSessionCurrent(sessionVersion)) throw new Error('登录状态已切换，请重试');
       const lastAssistantId = Math.max(0, ...beforeMessages.filter((item) => item.role === 'assistant').map((item) => Number(item.id) || 0));
       const prompt = buildPrompt(message, currentShop);
 
       try {
-        const streamedReply = await this.askBackendByStream({ conversationId, prompt, lastAssistantId, loadingId });
+        const streamedReply = await this.askBackendByStream({ conversationId, prompt, lastAssistantId, loadingId, sessionVersion });
         this.mode = 'backend';
         return streamedReply;
       } catch (error) {
+        if (!this.isSessionCurrent(sessionVersion)) throw error;
+        if (error?.chatRejected === true) throw error;
         const pollingReply = await this.waitAssistantByPolling({
           conversationId,
           prompt,
           lastAssistantId,
           loadingId,
-          shouldSend: error?.chatSent !== true
+          shouldSend: error?.chatSent !== true,
+          pollOnly: error?.chatSent === true,
+          sessionVersion
         });
         this.mode = 'backend';
         return pollingReply;
       }
     },
-    async askBackendByStream({ conversationId, prompt, lastAssistantId, loadingId }) {
+    async askBackendByStream({ conversationId, prompt, lastAssistantId, loadingId, sessionVersion = this.sessionVersion }) {
       const abortController = new AbortController();
       let chatSent = false;
+      let chatRequestAttempted = false;
+      let markStreamReady;
+      let failStreamReady;
+      const streamReady = new Promise((resolve, reject) => {
+        markStreamReady = resolve;
+        failStreamReady = reject;
+      });
 
       try {
         const replyPromise = new Promise((resolve, reject) => {
@@ -467,12 +604,14 @@ export const useAiStore = defineStore('ai', {
 
           aiApi.streamConversation(conversationId, {
             signal: abortController.signal,
+            onOpen: markStreamReady,
             onEvent: (event) => {
+              if (!this.isSessionCurrent(sessionVersion)) return;
               const payload = event?.data?.payload ?? event?.data ?? {};
               if (event.event === 'status') {
                 if (!streamingStarted) {
                   const detail = payload.detail || payload.status || 'AI 正在处理中...';
-                  this.updateMessageContent(loadingId, `正在思考中，请稍候...\n${detail}`);
+                  this.updateMessageContent(loadingId, `正在思考中，请稍候...\n${detail}`, false);
                 }
                 return;
               }
@@ -480,7 +619,7 @@ export const useAiStore = defineStore('ai', {
               if (event.event === 'answer_delta') {
                 streamingStarted = true;
                 streamingBuffer += payload.delta || '';
-                this.updateMessageContent(loadingId, streamingBuffer || 'AI 正在输出中...');
+                this.updateMessageContent(loadingId, streamingBuffer || 'AI 正在输出中...', false);
                 return;
               }
 
@@ -518,36 +657,57 @@ export const useAiStore = defineStore('ai', {
           }).catch((error) => {
             if (!resolved && error?.name !== 'AbortError') {
               resolved = true;
+              failStreamReady(error);
               reject(error);
             }
           });
         });
 
+        // The stream must be registered before a fast reply can be published.
+        replyPromise.catch(() => {});
+        await withTimeout(streamReady, 8000, '建立 AI 流式连接超时');
+        if (!this.isSessionCurrent(sessionVersion)) throw new Error('登录状态已切换，请重试');
+        chatRequestAttempted = true;
         await aiApi.chat({ conversationId, content: prompt });
         chatSent = true;
 
-        return await Promise.race([
-          replyPromise,
-          wait(AI_STREAM_WAIT_MS).then(() => {
-            throw new Error('等待 AI 流式回复超时');
-          })
-        ]);
+        return await withTimeout(replyPromise, AI_STREAM_WAIT_MS, '等待 AI 流式回复超时');
       } catch (error) {
-        error.chatSent = chatSent;
+        if (!this.isSessionCurrent(sessionVersion)) throw error;
+        error.chatSent = chatSent || chatRequestAttempted;
+        const responseStatus = Number(error?.response?.status);
+        error.chatRejected = chatRequestAttempted
+          && (error?.isBackendRejection === true || (responseStatus >= 400 && responseStatus < 500));
         throw error;
       } finally {
         abortController.abort();
       }
     },
-    async waitAssistantByPolling({ conversationId, prompt, lastAssistantId, loadingId, shouldSend = true }) {
+    async waitAssistantByPolling({ conversationId, prompt, lastAssistantId, loadingId, shouldSend = true, pollOnly = false, sessionVersion = this.sessionVersion }) {
+      let requestSubmitted = !shouldSend;
       if (shouldSend) {
         await aiApi.chat({ conversationId, content: prompt });
+        requestSubmitted = true;
       }
 
-      for (let attempt = 0; attempt < AI_POLL_ATTEMPTS; attempt += 1) {
-        this.updateMessageContent(loadingId, `正在思考中，请稍候...\n已切换到轮询模式（第 ${attempt + 1} 次检查）`);
-        await wait(1200);
-        const messages = await aiApi.getMessages(conversationId);
+      const pollAttempts = pollOnly ? Math.ceil(AI_STREAM_WAIT_MS / AI_POLL_INTERVAL_MS) : AI_POLL_ATTEMPTS;
+      let lastPollError = null;
+      for (let attempt = 0; attempt < pollAttempts; attempt += 1) {
+        if (!this.isSessionCurrent(sessionVersion)) throw new Error('登录状态已切换，请重试');
+        this.updateMessageContent(loadingId, `正在思考中，请稍候...\n已切换到轮询模式（第 ${attempt + 1} 次检查）`, false);
+        await wait(AI_POLL_INTERVAL_MS);
+        if (!this.isSessionCurrent(sessionVersion)) throw new Error('登录状态已切换，请重试');
+        let messages;
+        try {
+          messages = await aiApi.getMessages(conversationId);
+          lastPollError = null;
+        } catch (error) {
+          if ([401, 403].includes(Number(error?.response?.status))) {
+            throw error;
+          }
+          lastPollError = error;
+          continue;
+        }
         const latestAssistant = [...messages]
           .reverse()
           .find((item) => item.role === 'assistant' && (Number(item.id) || 0) > lastAssistantId);
@@ -561,6 +721,12 @@ export const useAiStore = defineStore('ai', {
         }
       }
 
+      if (lastPollError) {
+        throw new Error('暂时无法查询 AI 回复状态，请稍后重试或重新打开会话查看');
+      }
+      if (requestSubmitted) {
+        throw new Error('AI 仍在后台处理，请稍后重新打开会话查看最新回复');
+      }
       throw new Error('等待 AI 回复超时');
     }
   }

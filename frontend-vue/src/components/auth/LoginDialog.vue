@@ -7,7 +7,7 @@
       <el-form-item label="验证码">
         <div class="code-row">
           <el-input v-model="form.code" maxlength="6" placeholder="请输入验证码" @keyup.enter="submitLogin" />
-          <el-button :disabled="countdown > 0 || !form.phone" @click="sendCode">
+          <el-button :loading="sendingCode" :disabled="countdown > 0 || !form.phone || sendingCode" @click="sendCode">
             {{ countdown > 0 ? `${countdown}s 后重试` : '发送验证码' }}
           </el-button>
         </div>
@@ -24,11 +24,14 @@
 <script setup>
 import { ElMessage } from 'element-plus';
 import { useUserStore } from '@/store/user';
+import { resetLoginCodeCountdown } from '@/utils/login-code-countdown';
 
 const userStore = useUserStore();
 const submitting = ref(false);
+const sendingCode = ref(false);
 const countdown = ref(0);
 const timer = ref(null);
+let codeRequestId = 0;
 const form = reactive({
   phone: '',
   code: ''
@@ -44,26 +47,54 @@ const visible = computed({
 });
 
 onBeforeUnmount(() => {
-  if (timer.value) {
-    clearInterval(timer.value);
-  }
+  codeRequestId += 1;
+  resetLoginCodeCountdown({ timer, countdown }, clearInterval);
+});
+
+watch(() => form.phone, (phone, previousPhone) => {
+  if (phone === previousPhone) return;
+  codeRequestId += 1;
+  sendingCode.value = false;
+  form.code = '';
+  resetLoginCodeCountdown({ timer, countdown }, clearInterval);
 });
 
 async function sendCode() {
-  if (!form.phone) {
-    ElMessage.warning('请先输入手机号');
+  if (!form.phone || sendingCode.value || countdown.value > 0) {
+    if (!form.phone) {
+      ElMessage.warning('请先输入手机号');
+    }
     return;
   }
-  await userStore.sendCode(form.phone);
-  ElMessage.success('验证码已发送，请查看后端日志中的模拟验证码');
-  countdown.value = 60;
-  timer.value = setInterval(() => {
-    countdown.value -= 1;
-    if (countdown.value <= 0) {
-      clearInterval(timer.value);
-      timer.value = null;
+  const requestId = ++codeRequestId;
+  const requestedPhone = form.phone;
+  sendingCode.value = true;
+  try {
+    const mockCode = await userStore.sendCode(requestedPhone);
+    if (requestId !== codeRequestId || !visible.value || form.phone !== requestedPhone) return;
+    if (typeof mockCode === 'string' && /^\d{6}$/.test(mockCode)) {
+      form.code = mockCode;
+      ElMessage.success(`本地模拟验证码：${mockCode}`);
+    } else {
+      ElMessage.success('验证码已发送');
     }
-  }, 1000);
+    countdown.value = 60;
+    const countdownTimer = setInterval(() => {
+      if (timer.value !== countdownTimer) return;
+      countdown.value -= 1;
+      if (countdown.value <= 0) {
+        clearInterval(countdownTimer);
+        timer.value = null;
+      }
+    }, 1000);
+    timer.value = countdownTimer;
+  } catch (error) {
+    if (requestId === codeRequestId) {
+      ElMessage.error(error?.message || '验证码发送失败，请稍后重试');
+    }
+  } finally {
+    if (requestId === codeRequestId) sendingCode.value = false;
+  }
 }
 
 async function submitLogin() {
@@ -84,6 +115,9 @@ async function submitLogin() {
 }
 
 function resetForm() {
+  codeRequestId += 1;
+  sendingCode.value = false;
+  resetLoginCodeCountdown({ timer, countdown }, clearInterval);
   form.phone = '';
   form.code = '';
 }

@@ -3,6 +3,7 @@ package com.hmdp.controller;
 
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.hmdp.config.AdminApiGuard;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.service.IShopService;
@@ -28,6 +29,8 @@ public class ShopController {
 
     @Resource
     public IShopService shopService;
+    @Resource
+    private AdminApiGuard adminApiGuard;
 
     /**
      * 根据id查询商铺信息
@@ -45,11 +48,9 @@ public class ShopController {
      * @return 商铺id
      */
     @PostMapping
-    public Result saveShop(@RequestBody Shop shop) {
-        // 写入数据库
-        shopService.save(shop);
-        // 返回店铺id
-        return Result.ok(shop.getId());
+    public Result saveShop(@RequestHeader("X-Admin-Token") String token, @RequestBody Shop shop) {
+        adminApiGuard.verify(token);
+        return shopService.saveShop(shop);
     }
 
     /**
@@ -58,7 +59,8 @@ public class ShopController {
      * @return 无
      */
     @PutMapping
-    public Result updateShop(@RequestBody Shop shop) {
+    public Result updateShop(@RequestHeader("X-Admin-Token") String token, @RequestBody Shop shop) {
+        adminApiGuard.verify(token);
         // 写入数据库
         return shopService.update(shop);
     }
@@ -74,10 +76,11 @@ public class ShopController {
             @RequestParam("typeId") Integer typeId,
             @RequestParam(value = "current", defaultValue = "1") Integer current,
             @RequestParam(value = "x", required = false) Double x,
-            @RequestParam(value = "y", required = false) Double y
+            @RequestParam(value = "y", required = false) Double y,
+            @RequestParam(value = "name", required = false) String name
     ) {
-        log.info("根据商铺类型分页查询商铺信息，type:{},x:{},y:{},当前页数：{},",typeId,x,y,current);
-       return shopService.queryShopByType(typeId, current, x, y);
+        log.info("根据商铺类型分页查询商铺信息，type:{},name:{},x:{},y:{},当前页数：{},",typeId,name,x,y,current);
+       return shopService.queryShopByType(typeId, current, x, y, name);
     }
 
     /**
@@ -91,6 +94,13 @@ public class ShopController {
             @RequestParam(value = "name", required = false) String name,
             @RequestParam(value = "current", defaultValue = "1") Integer current
     ) {
+        if (current == null || current < 1) {
+            return Result.fail("店铺查询页码参数无效");
+        }
+        long maxPage = 1000L / SystemConstants.MAX_PAGE_SIZE;
+        if (current > maxPage) {
+            return Result.fail("店铺查询最多支持前1000条");
+        }
         log.info("根据商铺类型分页查询商铺信息，name:{}",name);
         // 根据类型分页查询
         Page<Shop> page = shopService.query()

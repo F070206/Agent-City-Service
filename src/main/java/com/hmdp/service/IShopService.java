@@ -21,6 +21,8 @@ public interface IShopService extends IService<Shop> {
 
     Result queryShopByType(Integer typeId, Integer current, Double x, Double y);
 
+    Result queryShopByType(Integer typeId, Integer current, Double x, Double y, String name);
+
     @Transactional
     Result saveShop(Shop shop);
 }

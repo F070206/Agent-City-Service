@@ -1,0 +1,18 @@
+server:
+  port: 8085
+spring:
+  autoconfigure:
+    exclude:
+      - org.apache.rocketmq.spring.autoconfigure.RocketMQAutoConfiguration
+      - org.springframework.ai.vectorstore.milvus.autoconfigure.MilvusVectorStoreAutoConfiguration
+  application:
+    name: cityai-ai
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/hmdp_ai?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+cityai:
+  internal:
+    token: ${CITYAI_INTERNAL_TOKEN}

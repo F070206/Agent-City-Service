@@ -56,6 +56,22 @@ public class BlogController {
         return blogService.queryHotBlog(current);
     }
 
+    @GetMapping("/of/shop")
+    public Result queryBlogByShopId(
+            @RequestParam("shopId") Long shopId,
+            @RequestParam(value = "current", defaultValue = "1") Integer current) {
+        if (shopId == null || shopId <= 0) {
+            return Result.fail("店铺 ID 必须大于 0");
+        }
+        if (current == null || current < 1) {
+            return Result.fail("页码必须大于等于 1");
+        }
+        if (current > 100) {
+            return Result.fail("仅支持查询前1000条笔记");
+        }
+        return blogService.queryBlogByShopId(shopId, current);
+    }
+
     @GetMapping("/{id}")
     public Result queryBlogById(@PathVariable("id") Long id) {
         return blogService.queryBlogById(id);

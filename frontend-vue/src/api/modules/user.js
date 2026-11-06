@@ -15,6 +15,12 @@ export const userApi = {
       data
     });
   },
+  logout() {
+    return request({
+      url: '/user/logout',
+      method: 'post'
+    });
+  },
   getMe() {
     return request({
       url: '/user/me',

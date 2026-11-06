@@ -8,6 +8,13 @@ export const blogApi = {
       params: { current }
     });
   },
+  getByShop(shopId, current = 1) {
+    return request({
+      url: '/blog/of/shop',
+      method: 'get',
+      params: { shopId, current }
+    });
+  },
   getMy(current = 1) {
     return request({
       url: '/blog/of/me',
@@ -15,11 +22,30 @@ export const blogApi = {
       params: { current }
     });
   },
-  create(data) {
+  create(data, authToken) {
     return request({
       url: '/blog',
       method: 'post',
-      data
+      data,
+      ...(typeof authToken === 'string' ? { __authTokenOverride: authToken } : {})
+    });
+  },
+  uploadImage(file, authToken) {
+    const formData = new FormData();
+    formData.append('file', file);
+    return request({
+      url: '/upload/blog',
+      method: 'post',
+      data: formData,
+      ...(typeof authToken === 'string' ? { __authTokenOverride: authToken } : {})
+    });
+  },
+  deleteImage(name, authToken) {
+    return request({
+      url: '/upload/blog',
+      method: 'delete',
+      params: { name },
+      ...(typeof authToken === 'string' ? { __authTokenOverride: authToken } : {})
     });
   },
   toggleLike(id) {

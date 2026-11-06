@@ -1,0 +1,24 @@
+spring:
+  cloud:
+    loadbalancer:
+      cache:
+        enabled: false
+    openfeign:
+      client:
+        config:
+          default:
+            connectTimeout: ${CITYAI_INTERNAL_CLIENT_CONNECT_TIMEOUT_MS:500}
+            readTimeout: ${CITYAI_INTERNAL_CLIENT_READ_TIMEOUT_MS:2000}
+            loggerLevel: basic
+    nacos:
+      discovery:
+        enabled: true
+        server-addr: ${NACOS_SERVER_ADDR:localhost:8848}
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db,redis

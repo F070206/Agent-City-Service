@@ -11,6 +11,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.UUID;
 
 import static com.hmdp.utils.RedisConstants.SECKILL_ORDER_PENDING_KEY;
 import static com.hmdp.utils.RedisConstants.SECKILL_STOCK_KEY;
@@ -32,21 +33,28 @@ public class OrderStockSyncWorker {
 
     @Scheduled(fixedDelayString = "${order.stock-sync.delay-ms:5000}")
     public void syncPending() {
-        for (OrderStockSync task : taskMapper.findPending()) {
+        String claimToken = UUID.randomUUID().toString();
+        taskMapper.claimPending(claimToken);
+        List<OrderStockSync> claimedTasks = taskMapper.findClaimed(claimToken);
+        for (OrderStockSync task : claimedTasks) {
             try {
                 Long result = redisTemplate.execute(RELEASE_SCRIPT, List.of(
                         SECKILL_STOCK_KEY + task.getVoucherId(),
                         "seckill:order:" + task.getVoucherId(),
                         "seckill:stock:released:" + task.getOrderId(),
-                        SECKILL_ORDER_PENDING_KEY + task.getOrderId()), task.getUserId().toString());
+                        SECKILL_ORDER_PENDING_KEY + task.getOrderId(),
+                        "seckill:order:reservation:" + task.getVoucherId()),
+                        task.getUserId().toString(), task.getOrderId().toString());
                 if (result == null || (result != 0L && result != 1L)) {
                     throw new IllegalStateException("Redis 库存或占用数据缺失，需核对后重试，result=" + result);
                 }
-                taskMapper.markCompleted(task.getOrderId());
+                if (taskMapper.markCompleted(task.getOrderId(), claimToken) != 1) {
+                    log.warn("库存同步已执行，但任务租约已由其他实例接管，订单ID={}", task.getOrderId());
+                }
             } catch (Exception e) {
                 log.error("关单库存同步失败，将重试，订单ID={}", task.getOrderId(), e);
                 try {
-                    taskMapper.recordFailure(task.getOrderId());
+                    taskMapper.recordFailure(task.getOrderId(), claimToken);
                 } catch (Exception retryError) {
                     // 数据库不可用时任务仍保持未完成，下次扫描会再次处理。
                     log.error("记录库存同步重试失败，订单ID={}", task.getOrderId(), retryError);

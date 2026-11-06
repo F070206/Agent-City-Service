@@ -16,13 +16,17 @@ import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.connection.BitFieldSubCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Value;
 
 import jakarta.annotation.Resource;
 import jakarta.servlet.http.HttpSession;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -42,8 +46,18 @@ import static com.hmdp.utils.SystemConstants.USER_NICK_NAME_PREFIX;
 @Service
 public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IUserService {
 
+    private static final DefaultRedisScript<Long> CONSUME_LOGIN_CODE = new DefaultRedisScript<>(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                    + "return redis.call('del', KEYS[1]) end return 0", Long.class);
+    private static final DefaultRedisScript<Long> SAVE_LOGIN_SESSION = new DefaultRedisScript<>(
+            "for i = 1, #ARGV - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end "
+                    + "return redis.call('PEXPIRE', KEYS[1], ARGV[#ARGV])", Long.class);
+
     @Resource
     private StringRedisTemplate stringRedisTemplate;
+
+    @Value("${cityai.auth.mock-code-enabled:false}")
+    private boolean mockCodeEnabled;
 
     @Override
     public Result sendCode(String phone, HttpSession session) {
@@ -57,13 +71,13 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
 
         String cachedCode = stringRedisTemplate.opsForValue().get(redisKey);
         if (!code.equals(cachedCode)) {
-            log.error("验证码写入Redis失败，phone={}, key={}", maskPhone(phone), redisKey);
+            log.error("验证码写入Redis失败，phone={}", maskPhone(phone));
             return Result.fail("验证码发送失败，请稍后重试");
         }
 
         Long expireSeconds = stringRedisTemplate.getExpire(redisKey, TimeUnit.SECONDS);
-        log.info("验证码发送成功，phone={}, key={}, ttlSeconds={}, code={}", maskPhone(phone), redisKey, expireSeconds, code);
-        return Result.ok();
+        log.info("验证码发送成功，phone={}, ttlSeconds={}", maskPhone(phone), expireSeconds);
+        return mockCodeEnabled ? Result.ok(code) : Result.ok();
     }
 
     @Override
@@ -72,9 +86,10 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         if (RegexUtils.isPhoneInvalid(phone)) {
             return Result.fail("手机号格式错误！");
         }
-        String cacheCode = stringRedisTemplate.opsForValue().get(LOGIN_CODE_KEY + phone);
         String code = loginForm.getCode();
-        if (cacheCode == null || !cacheCode.equals(code)) {
+        Long consumed = stringRedisTemplate.execute(CONSUME_LOGIN_CODE,
+                Collections.singletonList(LOGIN_CODE_KEY + phone), code);
+        if (!Long.valueOf(1).equals(consumed)) {
             return Result.fail("验证码错误");
         }
 
@@ -90,10 +105,29 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
                         .setIgnoreNullValue(true)
                         .setFieldValueEditor((fieldName, fieldValue) -> fieldValue.toString()));
         String tokenKey = LOGIN_USER_KEY + token;
-        stringRedisTemplate.opsForHash().putAll(tokenKey, userMap);
-        stringRedisTemplate.expire(tokenKey, LOGIN_USER_TTL, TimeUnit.MINUTES);
+        saveLoginSession(token, userMap);
 
         return Result.ok(token);
+    }
+
+    void saveLoginSession(String token, Map<String, Object> userMap) {
+        List<String> arguments = new ArrayList<>(userMap.size() * 2 + 1);
+        userMap.forEach((field, value) -> {
+            arguments.add(field);
+            arguments.add(String.valueOf(value));
+        });
+        arguments.add(Long.toString(TimeUnit.MINUTES.toMillis(LOGIN_USER_TTL)));
+        Long saved = stringRedisTemplate.execute(SAVE_LOGIN_SESSION,
+                Collections.singletonList(LOGIN_USER_KEY + token), arguments.toArray());
+        if (!Long.valueOf(1L).equals(saved)) {
+            throw new IllegalStateException("登录凭据写入或过期时间设置失败");
+        }
+    }
+
+    @Override
+    public Result logout(String token) {
+        stringRedisTemplate.delete(LOGIN_USER_KEY + token);
+        return Result.ok();
     }
 
     @Override
@@ -142,7 +176,9 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         User user = new User();
         user.setPhone(phone);
         user.setNickName(USER_NICK_NAME_PREFIX + RandomUtil.randomString(10));
-        save(user);
+        if (!save(user) || user.getId() == null) {
+            throw new IllegalStateException("创建用户失败，请稍后重试");
+        }
         return user;
     }
 

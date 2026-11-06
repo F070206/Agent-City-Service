@@ -24,9 +24,9 @@
           <div>
             <h1>{{ detail.name }}</h1>
             <div class="score-row">
-              <el-rate :model-value="detail.score" disabled allow-half />
-              <span>{{ detail.score }}</span>
-              <span>人均 ¥{{ detail.price }}</span>
+              <el-rate v-if="detail.score != null" :model-value="detail.score" disabled allow-half />
+              <span>{{ detail.score == null ? '暂无评分' : detail.score }}</span>
+              <span>{{ detail.price > 0 ? `人均 ¥${detail.price}` : '暂无人均价格' }}</span>
               <span>{{ detail.distance }}</span>
               <span class="tag-chip">{{ detail.status }}</span>
             </div>
@@ -62,6 +62,7 @@
                 <span>¥{{ dish.price }}</span>
               </div>
             </div>
+            <div v-if="!detail.dishes.length" class="empty-block">暂无菜品信息，可咨询商家</div>
           </div>
         </article>
 
@@ -99,17 +100,26 @@
                 </el-button>
               </div>
             </div>
-            <div v-if="!vouchers.length" class="empty-block">暂无可领取优惠券</div>
+            <div v-if="voucherLoadError" class="voucher-load-error" role="status">
+              <span>优惠券加载失败，请检查网络后重试。</span>
+              <el-button size="small" :loading="loadingVouchers" :disabled="loadingVouchers" @click="loadVouchers">
+                重试
+              </el-button>
+            </div>
+            <div v-if="loadingVouchers && !vouchers.length" class="empty-block">正在加载优惠券…</div>
+            <div v-else-if="!loadingVouchers && !voucherLoadError && !vouchers.length" class="empty-block">
+              暂无可领取优惠券
+            </div>
           </div>
 
-          <div v-if="latestOrderId" class="payment-box">
+          <div v-if="latestOrderId && userStore.isLoggedIn" class="payment-box">
             <strong>当前订单：{{ latestOrderId }}</strong>
-            <span class="order-status-text">{{ orderReady ? '订单已落库，可继续支付' : '订单创建中，请稍候后再支付' }}</span>
+            <span class="order-status-text">{{ latestOrderStatusText }}</span>
             <div class="payment-actions">
-              <el-button size="small" :loading="checkingOrder" @click="checkPaymentStatus">查状态</el-button>
-              <el-button size="small" :disabled="!orderReady" :loading="paying" @click="simulatePayment">模拟支付</el-button>
-              <el-button size="small" :disabled="!orderReady" :loading="paying" @click="openPayUrl('alipay')">支付宝</el-button>
-              <el-button size="small" :disabled="!orderReady" :loading="paying" @click="openPayUrl('wechat')">微信</el-button>
+              <el-button size="small" :disabled="checkingOrder || paying || checkingPaymentStatus" :loading="checkingOrder || checkingPaymentStatus" @click="checkPaymentStatus">查状态</el-button>
+              <el-button size="small" :disabled="!canPayLatestOrder || paying || checkingOrder || checkingPaymentStatus" :loading="paying && activePaymentAction === 'simulate'" @click="simulatePayment">模拟支付</el-button>
+              <el-button size="small" :disabled="!canPayLatestOrder || paying || checkingOrder || checkingPaymentStatus" :loading="paying && activePaymentAction === 'alipay'" @click="openPayUrl('alipay')">支付宝</el-button>
+              <el-button size="small" :disabled="!canPayLatestOrder || paying || checkingOrder || checkingPaymentStatus" :loading="paying && activePaymentAction === 'wechat'" @click="openPayUrl('wechat')">微信</el-button>
             </div>
           </div>
         </article>
@@ -117,10 +127,18 @@
 
       <section class="card-panel comments-panel">
         <div class="section-title">
-          <h2>用户评论</h2>
+          <h2>探店笔记</h2>
           <p>{{ commentTip }}</p>
         </div>
         <CommentItem v-for="comment in detail.comments" :key="comment.id" :comment="comment" />
+        <div v-if="shopBlogState === 'failed'" class="comment-load-error" role="status">
+          <span>探店笔记加载失败，请检查网络后重试。</span>
+          <el-button size="small" :loading="loadingShopBlogs" :disabled="loadingShopBlogs" @click="retryShopBlogs">
+            重试
+          </el-button>
+        </div>
+        <div v-else-if="shopBlogState === 'loading'" class="empty-block">正在加载探店笔记…</div>
+        <div v-else-if="shopBlogState === 'empty'" class="empty-block">当前暂无探店笔记</div>
       </section>
     </div>
   </div>
@@ -134,6 +152,10 @@ import { shopApi } from '@/api/modules/shop';
 import { voucherApi } from '@/api/modules/voucher';
 import { paymentApi } from '@/api/modules/payment';
 import { blogApi } from '@/api/modules/blog';
+import { canPayOrder, findLatestOrderForShop } from '@/utils/orders';
+import { getShopBlogState } from '@/utils/shop-blog-state';
+import { isCurrentShopRequest } from '@/utils/shop-request';
+import { createUserScopeGuard } from '@/utils/user-scope';
 import { aiApi } from '@/api/modules/ai';
 import { useAiStore } from '@/store/ai';
 import { useUserStore } from '@/store/user';
@@ -142,17 +164,31 @@ const route = useRoute();
 const router = useRouter();
 const aiStore = useAiStore();
 const userStore = useUserStore();
+const orderScopeGuard = createUserScopeGuard();
 const detail = ref(null);
+const detailRequestId = ref(0);
 const vouchers = ref([]);
+const voucherRequestId = ref(0);
+const loadingVouchers = ref(false);
+const voucherLoadError = ref(false);
 const latestOrderId = ref(null);
 const latestOrderMeta = ref(null);
 const usedRealComments = ref(false);
+const loadingShopBlogs = ref(false);
+const shopBlogsRequestId = ref(0);
 const usedAiInsight = ref(false);
 const orderReady = ref(false);
+const canPayLatestOrder = computed(() => canPayOrder(latestOrderMeta.value, orderReady.value));
+const latestOrderStatusText = computed(() => {
+  if (!orderReady.value) return '订单创建中，请稍候后再支付';
+  return `当前订单状态：${formatOrderStatus(latestOrderMeta.value?.status)}`;
+});
 const ordering = ref(false);
 const paying = ref(false);
 const checkingOrder = ref(false);
+const checkingPaymentStatus = ref(false);
 const activeVoucherId = ref(null);
+const activePaymentAction = ref(null);
 
 const carouselImages = computed(() => {
   if (!detail.value) return [];
@@ -161,48 +197,134 @@ const carouselImages = computed(() => {
     .slice(0, 3);
 });
 
-const dishTip = computed(() => (usedAiInsight.value ? '优先展示 AI 店铺分析得到的招牌菜结果' : '当前后端暂无菜品接口，这里展示本地演示数据'));
-const commentTip = computed(() => (usedRealComments.value ? '优先展示真实探店笔记内容作为门店评论' : '当前后端评论接口未实现，这里展示 mock 评论'));
+const dishTip = computed(() => (usedAiInsight.value ? '优先展示 AI 店铺分析得到的招牌菜结果' : '当前暂无商家菜品数据'));
+const commentTip = computed(() => {
+  if (usedRealComments.value) return '以下内容来自用户发布的真实探店笔记';
+  if (commentsLoadFailed.value) return '探店笔记暂时加载失败';
+  return '这里展示关联此店铺的探店笔记';
+});
+const shopBlogState = computed(() => getShopBlogState({
+  failed: commentsLoadFailed.value,
+  loading: loadingShopBlogs.value,
+  blogs: detail.value?.comments || []
+}));
+const commentsLoadFailed = ref(false);
 
-onMounted(loadDetail);
+onMounted(() => loadDetail(String(route.params.id)));
 
-async function loadDetail() {
+watch(
+  () => String(route.params.id),
+  (shopId) => {
+    detailRequestId.value += 1;
+    voucherRequestId.value += 1;
+    orderScopeGuard.invalidate();
+    detail.value = null;
+    vouchers.value = [];
+    voucherLoadError.value = false;
+    loadingVouchers.value = false;
+    latestOrderId.value = null;
+    latestOrderMeta.value = null;
+    orderReady.value = false;
+    usedRealComments.value = false;
+    commentsLoadFailed.value = false;
+    loadingShopBlogs.value = false;
+    usedAiInsight.value = false;
+    loadDetail(shopId);
+  }
+);
+
+watch(
+  () => JSON.stringify([currentOrderScope(), userStore.scopedStateVersion]),
+  () => syncLatestOrderForCurrentScope()
+);
+
+async function loadDetail(shopId) {
+  const requestId = ++detailRequestId.value;
   try {
-    const shopDetail = await shopApi.getDetail(route.params.id);
-    const [voucherList, insight, shopBlogs] = await Promise.all([
-      voucherApi.listByShop(route.params.id).catch(() => []),
-      aiApi.analyzeShop(route.params.id).catch(() => null),
-      loadShopBlogs(route.params.id)
+    const shopDetail = await shopApi.getDetail(shopId);
+    if (!isCurrentShopRequest(requestId, detailRequestId.value, shopId, route.params.id)) return;
+    const [, insight, shopBlogResult] = await Promise.all([
+      loadVouchers(shopId),
+      aiApi.analyzeShop(shopId).catch(() => null),
+      loadShopBlogs(shopId)
     ]);
+    if (!isCurrentShopRequest(requestId, detailRequestId.value, shopId, route.params.id)) return;
 
-    detail.value = mergeDetail(shopDetail, insight, shopBlogs);
-    vouchers.value = voucherList;
+    commentsLoadFailed.value = shopBlogResult.failed;
+    detail.value = mergeDetail(shopDetail, insight, shopBlogResult.blogs);
     aiStore.setCurrentShop(detail.value);
     const latestOrder = findLatestOrder(detail.value.id);
+    orderScopeGuard.invalidate();
     latestOrderId.value = latestOrder?.orderId || null;
     latestOrderMeta.value = latestOrder || null;
     if (latestOrderId.value) {
+      const ticket = orderScopeGuard.begin(currentOrderScope());
       const shouldWaitAsync = isAsyncPendingOrder(latestOrderMeta.value);
       orderReady.value = !shouldWaitAsync;
       if (shouldWaitAsync) {
-        await ensureOrderReady(latestOrderId.value, false);
+        await ensureOrderReady(latestOrderId.value, false, requestId, ticket);
       }
     }
   } catch (error) {
-    ElMessage.error(error?.message || '加载商家详情失败');
+    if (isCurrentShopRequest(requestId, detailRequestId.value, shopId, route.params.id)) {
+      ElMessage.error(error?.message || '加载商家详情失败');
+    }
+  }
+}
+
+async function loadVouchers(shopId = String(route.params.id)) {
+  const requestId = ++voucherRequestId.value;
+  loadingVouchers.value = true;
+  voucherLoadError.value = false;
+  try {
+    const list = await voucherApi.listByShop(shopId);
+    if (requestId !== voucherRequestId.value || String(route.params.id) !== String(shopId)) return;
+    vouchers.value = Array.isArray(list) ? list : [];
+  } catch {
+    if (requestId === voucherRequestId.value && String(route.params.id) === String(shopId)) {
+      voucherLoadError.value = true;
+    }
+  } finally {
+    if (requestId === voucherRequestId.value) loadingVouchers.value = false;
   }
 }
 
 async function loadShopBlogs(shopId) {
-  const results = [];
-  for (let page = 1; page <= 3 && results.length < 3; page += 1) {
-    const list = await blogApi.getHot(page).catch(() => []);
-    const matched = (list || []).filter((item) => Number(item.shopId) === Number(shopId));
-    results.push(...matched);
+  const requestId = ++shopBlogsRequestId.value;
+  loadingShopBlogs.value = true;
+  try {
+    const list = await blogApi.getByShop(shopId, 1);
+    return { blogs: (Array.isArray(list) ? list : []).slice(0, 3), failed: false };
+  } catch {
+    return { blogs: [], failed: true };
+  } finally {
+    if (requestId === shopBlogsRequestId.value) loadingShopBlogs.value = false;
   }
-  const uniqueMap = new Map();
-  results.forEach((item) => uniqueMap.set(item.id, item));
-  return [...uniqueMap.values()].slice(0, 3);
+}
+
+async function retryShopBlogs() {
+  if (loadingShopBlogs.value || !detail.value) return;
+  const shopId = String(route.params.id);
+  const requestId = detailRequestId.value;
+  commentsLoadFailed.value = false;
+  const result = await loadShopBlogs(shopId);
+  if (requestId !== detailRequestId.value || String(route.params.id) !== shopId) return;
+  commentsLoadFailed.value = result.failed;
+  if (result.failed) return;
+  if (result.blogs.length) {
+    detail.value.comments = result.blogs.map((blog) => ({
+      id: blog.id,
+      user: blog.name || '匿名用户',
+      avatar: blog.icon || 'https://dummyimage.com/80x80/ffb36d/ffffff&text=U',
+      score: calculateBlogScore(blog),
+      content: blog.content || blog.title || '这位用户没有留下更多文字评价。',
+      images: parseImages(blog.images)
+    }));
+    usedRealComments.value = true;
+  } else {
+    detail.value.comments = [];
+    usedRealComments.value = false;
+  }
 }
 
 function mergeDetail(baseDetail, insight, shopBlogs) {
@@ -261,8 +383,42 @@ function calculateBlogScore(blog) {
 }
 
 function findLatestOrder(shopId) {
-  const orders = userStore.orderHistory.filter((item) => Number(item.shopId) === Number(shopId));
-  return orders[0] || null;
+  return findLatestOrderForShop(userStore.orderHistory, shopId);
+}
+
+function currentOrderScope() {
+  return JSON.stringify([userStore.token, userStore.profile?.id ?? '']);
+}
+
+function isCurrentOrderScope(ticket, orderId, pageRequestId = detailRequestId.value) {
+  return pageRequestId === detailRequestId.value
+    && orderScopeGuard.isCurrent(ticket, currentOrderScope())
+    && String(latestOrderId.value) === String(orderId);
+}
+
+function syncLatestOrderForCurrentScope() {
+  orderScopeGuard.invalidate();
+  latestOrderId.value = null;
+  latestOrderMeta.value = null;
+  orderReady.value = false;
+  if (!detail.value || !userStore.isLoggedIn) return;
+
+  const latestOrder = findLatestOrder(detail.value.id);
+  if (!latestOrder) return;
+  latestOrderId.value = String(latestOrder.orderId);
+  latestOrderMeta.value = latestOrder;
+  const ticket = orderScopeGuard.begin(currentOrderScope());
+  const shouldWaitAsync = isAsyncPendingOrder(latestOrderMeta.value);
+  orderReady.value = !shouldWaitAsync;
+  if (shouldWaitAsync) {
+    const orderId = latestOrderId.value;
+    const pageRequestId = detailRequestId.value;
+    void ensureOrderReady(orderId, false, pageRequestId, ticket).catch((error) => {
+      if (isCurrentOrderScope(ticket, orderId, pageRequestId)) {
+        ElMessage.error(error?.message || '查询订单状态失败');
+      }
+    });
+  }
 }
 
 function toggleFavorite() {
@@ -352,6 +508,8 @@ function isAsyncPendingOrder(order) {
 }
 
 async function submitVoucherOrder(voucher) {
+  const shop = detail.value;
+  if (!shop) return;
   if (!canPurchaseVoucher(voucher)) {
     ElMessage.warning(`${getVoucherStatusText(voucher)}，暂不可下单`);
     return;
@@ -359,36 +517,42 @@ async function submitVoucherOrder(voucher) {
   activeVoucherId.value = voucher.id;
   try {
     if (isSeckillVoucher(voucher)) {
-      await seckillVoucher(voucher);
+      await seckillVoucher(voucher, shop);
       return;
     }
-    await buyVoucher(voucher);
+    await buyVoucher(voucher, shop);
   } finally {
     activeVoucherId.value = null;
   }
 }
 
-async function buyVoucher(voucher) {
+async function buyVoucher(voucher, shop) {
   if (!userStore.isLoggedIn) {
     userStore.openLoginDialog();
     return;
   }
+  const requestScope = currentOrderScope();
   ordering.value = true;
   try {
-    latestOrderId.value = String(await voucherApi.buy(voucher.id));
-    latestOrderMeta.value = {
-      orderId: latestOrderId.value,
-      shopId: detail.value.id,
-      voucherId: voucher.id,
-      voucherType: voucher.type,
-      asyncCreated: false,
-      status: 1
-    };
-    orderReady.value = true;
+    const orderId = String(await voucherApi.buy(voucher.id));
+    if (requestScope !== currentOrderScope()) return;
+    if (String(route.params.id) === String(shop.id)) {
+      orderScopeGuard.invalidate();
+      latestOrderId.value = orderId;
+      latestOrderMeta.value = {
+        orderId,
+        shopId: shop.id,
+        voucherId: voucher.id,
+        voucherType: voucher.type,
+        asyncCreated: false,
+        status: 1
+      };
+      orderReady.value = true;
+    }
     userStore.recordOrder({
-      orderId: latestOrderId.value,
-      shopId: detail.value.id,
-      shopName: detail.value.name,
+      orderId,
+      shopId: shop.id,
+      shopName: shop.name,
       voucherId: voucher.id,
       voucherTitle: voucher.title,
       voucherType: voucher.type,
@@ -397,66 +561,101 @@ async function buyVoucher(voucher) {
       actualAmount: formatMoney(voucher.actualValue),
       status: 1
     });
-    ElMessage.success(`普通券下单成功，订单ID：${latestOrderId.value}，可以直接支付`);
+    ElMessage.success(`普通券下单成功，订单ID：${orderId}${String(route.params.id) === String(shop.id) ? '，可以直接支付' : ''}`);
   } catch (error) {
-    ElMessage.error(error?.message || '普通券购买失败');
+    if (requestScope === currentOrderScope()) {
+      ElMessage.error(error?.message || '普通券购买失败');
+    }
   } finally {
     ordering.value = false;
   }
 }
 
-async function seckillVoucher(voucher) {
+async function seckillVoucher(voucher, shop) {
   if (!userStore.isLoggedIn) {
     userStore.openLoginDialog();
     return;
   }
+  const requestScope = currentOrderScope();
   ordering.value = true;
   try {
-    latestOrderId.value = String(await voucherApi.seckill(voucher.id));
-    latestOrderMeta.value = {
-      orderId: latestOrderId.value,
-      shopId: detail.value.id,
-      voucherId: voucher.id,
-      voucherType: voucher.type,
-      asyncCreated: true,
-      status: 1
-    };
-    orderReady.value = false;
+    let orderId;
+    let needsConfirmation = false;
+    try {
+      orderId = await voucherApi.seckill(voucher.id);
+    } catch (error) {
+      if (error?.data?.pending !== true || error.data.orderId == null) throw error;
+      orderId = error.data.orderId;
+      needsConfirmation = true;
+    }
+    if (requestScope !== currentOrderScope()) return;
+    const createdOrderId = String(orderId);
+    const isCurrentShop = String(route.params.id) === String(shop.id);
+    if (isCurrentShop) {
+      orderScopeGuard.invalidate();
+      latestOrderId.value = createdOrderId;
+      latestOrderMeta.value = {
+        orderId: createdOrderId,
+        shopId: shop.id,
+        voucherId: voucher.id,
+        voucherType: voucher.type,
+        asyncCreated: true,
+        creationPending: true,
+        status: 1
+      };
+      orderReady.value = false;
+    }
     userStore.recordOrder({
-      orderId: latestOrderId.value,
-      shopId: detail.value.id,
-      shopName: detail.value.name,
+      orderId: createdOrderId,
+      shopId: shop.id,
+      shopName: shop.name,
       voucherId: voucher.id,
       voucherTitle: voucher.title,
       voucherType: voucher.type,
       asyncCreated: true,
+      creationPending: true,
       payAmount: formatMoney(voucher.payValue),
       actualAmount: formatMoney(voucher.actualValue),
       status: 1
     });
-    ElMessage.success(`抢券成功，订单ID：${latestOrderId.value}，正在等待订单落库`);
-    await ensureOrderReady(latestOrderId.value, true);
+    ElMessage.info(needsConfirmation
+      ? `订单受理结果待确认，订单ID：${createdOrderId}`
+      : `抢券成功，订单ID：${createdOrderId}，正在等待订单落库`);
+    if (isCurrentShop) {
+      const ticket = orderScopeGuard.begin(requestScope);
+      await ensureOrderReady(createdOrderId, true, detailRequestId.value, ticket);
+    }
   } catch (error) {
-    ElMessage.error(error?.message || '抢券失败');
+    if (requestScope === currentOrderScope()) {
+      ElMessage.error(error?.message || '抢券失败');
+    }
   } finally {
     ordering.value = false;
   }
 }
 
-async function ensureOrderReady(orderId, notifyWhenReady = false) {
+async function ensureOrderReady(
+  orderId,
+  notifyWhenReady = false,
+  pageRequestId = detailRequestId.value,
+  ticket
+) {
+  if (!ticket) return false;
   checkingOrder.value = true;
   try {
     const targetOrderId = String(orderId);
     for (let attempt = 0; attempt < 10; attempt += 1) {
+      if (!isCurrentOrderScope(ticket, targetOrderId, pageRequestId)) return false;
       try {
         const status = await paymentApi.status(targetOrderId);
+        if (!isCurrentOrderScope(ticket, targetOrderId, pageRequestId)) return false;
         if (Number(status) === 0) {
           await wait(800);
           continue;
         }
-        orderReady.value = true;
-        userStore.updateOrder(targetOrderId, { status: Number(status) });
+        userStore.updateOrder(targetOrderId, { status: Number(status), creationPending: false });
         if (latestOrderMeta.value && String(latestOrderMeta.value.orderId) === targetOrderId) {
+          orderReady.value = true;
           latestOrderMeta.value = {
             ...latestOrderMeta.value,
             status: Number(status)
@@ -467,13 +666,16 @@ async function ensureOrderReady(orderId, notifyWhenReady = false) {
         }
         return true;
       } catch (error) {
+        if (!isCurrentOrderScope(ticket, targetOrderId, pageRequestId)) return false;
         if (!String(error?.message || '').includes('订单不存在') && !String(error?.message || '').includes('订单创建中')) {
           throw error;
         }
         await wait(800);
       }
     }
-    ElMessage.warning('订单正在排队创建，请稍后再点击支付');
+    if (isCurrentOrderScope(ticket, targetOrderId, pageRequestId)) {
+      ElMessage.warning('订单正在排队创建，请稍后再点击支付');
+    }
     return false;
   } finally {
     checkingOrder.value = false;
@@ -481,14 +683,19 @@ async function ensureOrderReady(orderId, notifyWhenReady = false) {
 }
 
 async function checkPaymentStatus() {
-  if (!latestOrderId.value) return;
+  if (!latestOrderId.value || checkingPaymentStatus.value || paying.value) return;
+  const orderId = String(latestOrderId.value);
+  const pageRequestId = detailRequestId.value;
+  const ticket = orderScopeGuard.begin(currentOrderScope());
+  checkingPaymentStatus.value = true;
   try {
     const ready = isAsyncPendingOrder(latestOrderMeta.value)
-      ? await ensureOrderReady(latestOrderId.value, false)
+      ? await ensureOrderReady(orderId, false, pageRequestId, ticket)
       : true;
-    if (!ready) return;
-    const status = await paymentApi.status(latestOrderId.value);
-    userStore.updateOrder(latestOrderId.value, { status: Number(status) });
+    if (!ready || !isCurrentOrderScope(ticket, orderId, pageRequestId)) return;
+    const status = await paymentApi.status(orderId);
+    if (!isCurrentOrderScope(ticket, orderId, pageRequestId)) return;
+    userStore.updateOrder(orderId, { status: Number(status) });
     if (latestOrderMeta.value) {
       latestOrderMeta.value = {
         ...latestOrderMeta.value,
@@ -497,20 +704,29 @@ async function checkPaymentStatus() {
     }
     ElMessage.success(`当前订单状态：${formatOrderStatus(status)}`);
   } catch (error) {
-    ElMessage.error(error?.message || '查询状态失败');
+    if (isCurrentOrderScope(ticket, orderId, pageRequestId)) {
+      ElMessage.error(error?.message || '查询状态失败');
+    }
+  } finally {
+    checkingPaymentStatus.value = false;
   }
 }
 
 async function simulatePayment() {
-  if (!latestOrderId.value) return;
+  if (!latestOrderId.value || paying.value || checkingOrder.value || checkingPaymentStatus.value) return;
+  const orderId = String(latestOrderId.value);
+  const pageRequestId = detailRequestId.value;
+  const ticket = orderScopeGuard.begin(currentOrderScope());
   paying.value = true;
+  activePaymentAction.value = 'simulate';
   try {
     const ready = isAsyncPendingOrder(latestOrderMeta.value)
-      ? await ensureOrderReady(latestOrderId.value, false)
+      ? await ensureOrderReady(orderId, false, pageRequestId, ticket)
       : true;
-    if (!ready) return;
-    const result = await paymentApi.simulate(latestOrderId.value);
-    userStore.updateOrder(latestOrderId.value, { status: 2, payType: 1 });
+    if (!ready || !isCurrentOrderScope(ticket, orderId, pageRequestId)) return;
+    const result = await paymentApi.simulate(orderId);
+    if (!isCurrentOrderScope(ticket, orderId, pageRequestId)) return;
+    userStore.updateOrder(orderId, { status: 2, payType: 1 });
     orderReady.value = true;
     if (latestOrderMeta.value) {
       latestOrderMeta.value = {
@@ -521,24 +737,32 @@ async function simulatePayment() {
     }
     ElMessage.success(typeof result === 'string' ? result : '模拟支付成功');
   } catch (error) {
-    ElMessage.error(error?.message || '模拟支付失败');
+    if (isCurrentOrderScope(ticket, orderId, pageRequestId)) {
+      ElMessage.error(error?.message || '模拟支付失败');
+    }
   } finally {
     paying.value = false;
+    activePaymentAction.value = null;
   }
 }
 
 async function openPayUrl(type) {
-  if (!latestOrderId.value) return;
+  if (!latestOrderId.value || paying.value || checkingOrder.value || checkingPaymentStatus.value) return;
+  const orderId = String(latestOrderId.value);
+  const pageRequestId = detailRequestId.value;
+  const ticket = orderScopeGuard.begin(currentOrderScope());
   paying.value = true;
+  activePaymentAction.value = type;
   try {
     const ready = isAsyncPendingOrder(latestOrderMeta.value)
-      ? await ensureOrderReady(latestOrderId.value, false)
+      ? await ensureOrderReady(orderId, false, pageRequestId, ticket)
       : true;
-    if (!ready) return;
+    if (!ready || !isCurrentOrderScope(ticket, orderId, pageRequestId)) return;
     const result = type === 'alipay'
-      ? await paymentApi.alipay(latestOrderId.value)
-      : await paymentApi.wechat(latestOrderId.value);
-    userStore.updateOrder(latestOrderId.value, { payType: type === 'alipay' ? 2 : 3 });
+      ? await paymentApi.alipay(orderId)
+      : await paymentApi.wechat(orderId);
+    if (!isCurrentOrderScope(ticket, orderId, pageRequestId)) return;
+    userStore.updateOrder(orderId, { payType: type === 'alipay' ? 2 : 3 });
     if (latestOrderMeta.value) {
       latestOrderMeta.value = {
         ...latestOrderMeta.value,
@@ -547,9 +771,12 @@ async function openPayUrl(type) {
     }
     ElMessage.success(result?.payUrl ? `支付链接：${result.payUrl}` : '支付链接已生成');
   } catch (error) {
-    ElMessage.error(error?.message || '创建支付单失败');
+    if (isCurrentOrderScope(ticket, orderId, pageRequestId)) {
+      ElMessage.error(error?.message || '创建支付单失败');
+    }
   } finally {
     paying.value = false;
+    activePaymentAction.value = null;
   }
 }
 
@@ -646,6 +873,7 @@ function wait(duration) {
 .dish-item p { margin: 8px 0; color: #666; }
 .dish-item span { color: var(--dp-primary); font-weight: 700; }
 .offer-list { display: grid; gap: 12px; }
+.voucher-load-error { display: flex; align-items: center; gap: 10px; color: #c45656; }
 .offer-item {
   display: grid;
   grid-template-columns: 1fr auto;

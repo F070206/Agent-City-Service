@@ -48,8 +48,16 @@
         </div>
 
         <div class="load-box">
-          <el-button plain :loading="loading" @click="loadMore">加载更多</el-button>
-          <p>{{ homeData.hasMore ? '继续下拉或点击按钮加载更多' : '已经到底啦' }}</p>
+          <div v-if="homeLoadError" class="blog-load-error" role="status">
+            <span>{{ homeLoadError }}</span>
+            <el-button size="small" :loading="loading" :disabled="loading" @click="retryHomeData">重试</el-button>
+          </div>
+          <el-button v-if="homeData.hasMore" plain :loading="loading" :disabled="loading || homeSearchDirty || Boolean(homeLoadError)" @click="loadMore">
+            加载更多
+          </el-button>
+          <p v-if="homeSearchDirty">条件已更改，请点击搜索查看结果</p>
+          <p v-else-if="!homeData.hasMore && !homeLoadError">已经到底啦</p>
+          <p v-else-if="homeData.hasMore && !homeLoadError">继续下拉或点击按钮加载更多</p>
         </div>
       </section>
 
@@ -58,6 +66,14 @@
           <h2>探店热榜</h2>
           <p>真实联调 `/blog/hot` 与点赞接口</p>
         </div>
+        <div v-if="hotBlogsError" class="blog-load-error" role="status">
+          <span>热榜加载失败，请检查网络后重试。</span>
+          <el-button size="small" :loading="loadingHotBlogs" @click="loadHotBlogs">重试</el-button>
+        </div>
+        <p v-if="loadingHotBlogs && !hotBlogs.length" class="blog-list-hint">正在加载热榜…</p>
+        <p v-else-if="!loadingHotBlogs && !hotBlogsError && !hotBlogs.length" class="blog-list-hint">
+          暂无探店笔记
+        </p>
         <div class="blog-list">
           <article v-for="blog in hotBlogs" :key="blog.id" class="blog-card hover-lift">
             <div class="blog-main">
@@ -77,6 +93,8 @@
               <el-button
                 size="small"
                 :type="blog.isLike ? 'success' : 'primary'"
+                :loading="likingBlogIds.has(Number(blog.id))"
+                :disabled="likingBlogIds.has(Number(blog.id))"
                 plain
                 @click="toggleBlogLike(blog)"
               >
@@ -106,7 +124,12 @@
         <p class="detail-content">{{ activeBlog.content || '暂无详细内容' }}</p>
         <div class="detail-footer-actions">
           <el-button v-if="activeBlog.shopId" @click="goShop(activeBlog.shopId)">去店铺</el-button>
-          <el-button :type="activeBlog.isLike ? 'success' : 'primary'" @click="toggleBlogLike(activeBlog)">
+          <el-button
+            :type="activeBlog.isLike ? 'success' : 'primary'"
+            :loading="likingBlogIds.has(Number(activeBlog.id))"
+            :disabled="likingBlogIds.has(Number(activeBlog.id))"
+            @click="toggleBlogLike(activeBlog)"
+          >
             {{ activeBlog.isLike ? '已点赞' : '点赞' }}
           </el-button>
         </div>
@@ -125,6 +148,7 @@ import CategoryGrid from '@/components/home/CategoryGrid.vue';
 import ShopCard from '@/components/common/ShopCard.vue';
 import { homeApi } from '@/api/modules/home';
 import { blogApi } from '@/api/modules/blog';
+import { createUserScopeGuard } from '@/utils/user-scope';
 import { useAiStore } from '@/store/ai';
 import { useUserStore } from '@/store/user';
 
@@ -133,8 +157,12 @@ const aiStore = useAiStore();
 const userStore = useUserStore();
 
 const loading = ref(false);
+let refreshQueued = false;
 const page = ref(1);
 const keyword = ref('');
+const loadedKeyword = ref('');
+const loadedCity = ref(userStore.city);
+const homeLoadError = ref('');
 const homeData = ref({
   banners: [],
   categories: [],
@@ -143,8 +171,14 @@ const homeData = ref({
 });
 const mergedShops = ref([]);
 const hotBlogs = ref([]);
+const hotBlogsError = ref(false);
+const loadingHotBlogs = ref(false);
+let hotBlogsRefreshQueued = false;
+const hotBlogsSessionGuard = createUserScopeGuard();
+const likingBlogIds = ref(new Set());
 const detailDialogVisible = ref(false);
 const activeBlog = ref(null);
+const homeSearchDirty = computed(() => keyword.value.trim() !== loadedKeyword.value || userStore.city !== loadedCity.value);
 
 const touchStartY = ref(0);
 const pullDistance = ref(0);
@@ -166,18 +200,23 @@ onBeforeUnmount(() => {
   window.removeEventListener('scroll', handleScroll);
 });
 
-async function loadHomeData(refresh = false) {
-  if (loading.value) return;
+async function loadHomeData(
+  refresh = false,
+  requestedPage = refresh ? 1 : page.value,
+  requestedKeyword = refresh ? keyword.value.trim() : loadedKeyword.value,
+  requestedCity = refresh ? userStore.city : loadedCity.value
+) {
+  if (loading.value) {
+    if (refresh) refreshQueued = true;
+    return false;
+  }
   loading.value = true;
+  homeLoadError.value = '';
   try {
-    if (refresh) {
-      page.value = 1;
-      mergedShops.value = [];
-    }
     const data = await homeApi.getHomeData({
-      page: page.value,
-      keyword: keyword.value,
-      city: userStore.city
+      page: requestedPage,
+      keyword: requestedKeyword,
+      city: requestedCity
     });
     homeData.value = data;
     if (refresh) {
@@ -186,26 +225,59 @@ async function loadHomeData(refresh = false) {
       const ids = new Set(mergedShops.value.map((item) => item.id));
       mergedShops.value = [...mergedShops.value, ...data.shops.filter((item) => !ids.has(item.id))];
     }
+    page.value = requestedPage;
+    if (refresh) {
+      loadedKeyword.value = requestedKeyword;
+      loadedCity.value = requestedCity;
+    }
+    return true;
   } catch (error) {
-    ElMessage.error(error?.message || '加载首页数据失败');
+    homeLoadError.value = error?.message || '加载首页数据失败';
+    return false;
   } finally {
     loading.value = false;
     pullDistance.value = 0;
+    if (refreshQueued) {
+      refreshQueued = false;
+      void loadHomeData(true, 1);
+    }
   }
 }
 
 async function loadMore() {
-  if (!homeData.value.hasMore || loading.value) return;
-  page.value += 1;
-  await loadHomeData();
+  if (!homeData.value.hasMore || loading.value || homeLoadError.value || homeSearchDirty.value) return;
+  await loadHomeData(false, page.value + 1);
+}
+
+function retryHomeData() {
+  void loadHomeData(true, 1);
 }
 
 async function loadHotBlogs() {
+  if (loadingHotBlogs.value) {
+    hotBlogsRefreshQueued = true;
+    return;
+  }
+  const requestedToken = userStore.token;
+  const sessionTicket = hotBlogsSessionGuard.begin(requestedToken);
+  loadingHotBlogs.value = true;
   try {
     const list = await blogApi.getHot(1);
+    if (!hotBlogsSessionGuard.isCurrent(sessionTicket, userStore.token)) {
+      hotBlogsRefreshQueued = true;
+      return;
+    }
     hotBlogs.value = (list || []).map(normalizeBlog);
+    hotBlogsError.value = false;
   } catch {
-    hotBlogs.value = [];
+    if (hotBlogsSessionGuard.isCurrent(sessionTicket, userStore.token)) hotBlogsError.value = true;
+    else hotBlogsRefreshQueued = true;
+  } finally {
+    loadingHotBlogs.value = false;
+    if (hotBlogsRefreshQueued) {
+      hotBlogsRefreshQueued = false;
+      void loadHotBlogs();
+    }
   }
 }
 
@@ -227,18 +299,34 @@ function handleAiRecommend(shop) {
 }
 
 async function toggleBlogLike(blog) {
+  const blogId = Number(blog?.id);
+  if (!Number.isFinite(blogId) || likingBlogIds.value.has(blogId)) return;
   if (!userStore.isLoggedIn) {
     userStore.openLoginDialog();
     return;
   }
+  const nextIsLike = !blog.isLike;
+  const requestToken = userStore.token;
+  likingBlogIds.value = new Set([...likingBlogIds.value, blogId]);
   try {
-    await blogApi.toggleLike(blog.id);
-    const nextIsLike = !blog.isLike;
+    await blogApi.toggleLike(blogId);
+    if (requestToken !== userStore.token) {
+      void loadHotBlogs();
+      return;
+    }
     const nextLiked = Math.max(0, Number(blog.liked || 0) + (nextIsLike ? 1 : -1));
-    patchBlog(blog.id, { isLike: nextIsLike, liked: nextLiked });
+    patchBlog(blogId, { isLike: nextIsLike, liked: nextLiked });
     ElMessage.success(nextIsLike ? '点赞成功' : '已取消点赞');
   } catch (error) {
-    ElMessage.error(error?.message || '更新点赞状态失败');
+    if (requestToken === userStore.token) {
+      ElMessage.error(error?.message || '更新点赞状态失败');
+    } else {
+      void loadHotBlogs();
+    }
+  } finally {
+    const pending = new Set(likingBlogIds.value);
+    pending.delete(blogId);
+    likingBlogIds.value = pending;
   }
 }
 
@@ -336,6 +424,8 @@ function handleScroll() {
   color: #999;
 }
 .blog-section { padding: 18px; margin-top: 8px; }
+.blog-load-error { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; color: #c45656; }
+.blog-list-hint { margin: 0; color: #999; }
 .blog-list { display: grid; gap: 12px; }
 .blog-card {
   display: grid;

@@ -1,7 +1,38 @@
 server:
   port: 8083
 
+blog:
+  feed:
+    max-entries: ${BLOG_FEED_MAX_ENTRIES:1000}
+
+shop:
+  cache:
+    rebuild:
+      threads: ${SHOP_CACHE_REBUILD_THREADS:10}
+      queue-capacity: ${SHOP_CACHE_REBUILD_QUEUE_CAPACITY:1000}
+      keep-alive-seconds: ${SHOP_CACHE_REBUILD_KEEP_ALIVE_SECONDS:60}
+
+management:
+  server:
+    port: ${MANAGEMENT_SERVER_PORT:8086}
+    address: 127.0.0.1
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+
 spring:
+  servlet:
+    multipart:
+      max-file-size: 8MB
+      max-request-size: 10MB
+  web:
+    resources:
+      static-locations: classpath:/static/,file:${CITYAI_UPLOAD_DIR:./uploads}/
+  cloud:
+    nacos:
+      discovery:
+        enabled: false
   application:
     name: hm-dianping
   datasource:
@@ -34,6 +65,7 @@ spring:
       port: 6379
       lettuce:
         pool:
+          enabled: true
           max-active: 10
           max-idle: 10
           min-idle: 1
@@ -44,6 +76,13 @@ spring:
 logging:
   level:
     com.hmdp: info
+
+cityai:
+  upload-dir: ${CITYAI_UPLOAD_DIR:./uploads}
+  auth:
+    mock-code-enabled: ${CITYAI_AUTH_MOCK_CODE_ENABLED:false}
+  admin:
+    token: ${CITYAI_ADMIN_TOKEN:}
 
 mybatis-plus:
   configuration:
@@ -62,6 +101,8 @@ id:
     datacenter-id: ${SNOWFLAKE_DATACENTER_ID:0}
 
 ai:
+  sse:
+    max-connections-per-user: ${AI_SSE_MAX_CONNECTIONS_PER_USER:8}
   agent:
     bootstrap:
       enabled: ${AI_AGENT_BOOTSTRAP_ENABLED:true}
@@ -73,11 +114,22 @@ ai:
       read-timeout-seconds: ${AI_AGENT_MODEL_READ_TIMEOUT_SECONDS:90}
       write-timeout-seconds: ${AI_AGENT_MODEL_WRITE_TIMEOUT_SECONDS:90}
       call-timeout-seconds: ${AI_AGENT_MODEL_CALL_TIMEOUT_SECONDS:120}
+    circuit:
+      enabled: ${AI_AGENT_CIRCUIT_ENABLED:true}
+      window-seconds: ${AI_AGENT_CIRCUIT_WINDOW_SECONDS:60}
+      recovery-seconds: ${AI_AGENT_CIRCUIT_RECOVERY_SECONDS:10}
+      min-requests: ${AI_AGENT_CIRCUIT_MIN_REQUESTS:5}
+      error-ratio: ${AI_AGENT_CIRCUIT_ERROR_RATIO:0.5}
+      slow-ratio: ${AI_AGENT_CIRCUIT_SLOW_RATIO:0.5}
+      model-slow-millis: ${AI_AGENT_CIRCUIT_MODEL_SLOW_MILLIS:8000}
+      stream-slow-millis: ${AI_AGENT_CIRCUIT_STREAM_SLOW_MILLIS:30000}
+      tool-slow-millis: ${AI_AGENT_CIRCUIT_TOOL_SLOW_MILLIS:2000}
     streaming:
       enabled: ${AI_AGENT_STREAMING_ENABLED:true}
       timeout-seconds: ${AI_AGENT_STREAMING_TIMEOUT_SECONDS:75}
       fallback-chunk-size: ${AI_AGENT_STREAMING_FALLBACK_CHUNK_SIZE:24}
     insight:
+      max-nearby-page: ${AI_AGENT_INSIGHT_MAX_NEARBY_PAGE:20}
       max-review-samples: ${AI_AGENT_INSIGHT_MAX_REVIEW_SAMPLES:8}
       max-review-chars-per-sample: ${AI_AGENT_INSIGHT_MAX_REVIEW_CHARS_PER_SAMPLE:280}
       max-combined-chars: ${AI_AGENT_INSIGHT_MAX_COMBINED_CHARS:2200}
@@ -86,13 +138,16 @@ ai:
     multi-agent:
       max-steps: ${AI_AGENT_MULTI_AGENT_MAX_STEPS:20}
     rag:
+      vector-store-enabled: ${AI_AGENT_RAG_VECTOR_STORE_ENABLED:true}
       top-k: ${AI_AGENT_RAG_TOP_K:5}
+      max-top-k: ${AI_AGENT_RAG_MAX_TOP_K:20}
       similarity-threshold: ${AI_AGENT_RAG_SIMILARITY_THRESHOLD:0.65}
       knowledge-similarity-threshold: ${AI_AGENT_RAG_KNOWLEDGE_SIMILARITY_THRESHOLD:0.35}
       collections:
         knowledge: knowledge_vector
         shop-profile: shop_profile_vector
         blog-review: blog_review_vector
+      allow-destructive-collection-reset: ${AI_AGENT_RAG_ALLOW_DESTRUCTIVE_COLLECTION_RESET:false}
     mcp:
       enabled: ${AI_AGENT_MCP_ENABLED:false}
       timeout-millis: ${AI_AGENT_MCP_TIMEOUT_MILLIS:2500}
@@ -102,12 +157,17 @@ ai:
       route:
         enabled: ${AI_AGENT_MCP_ROUTE_ENABLED:false}
         base-url: ${AI_AGENT_MCP_ROUTE_BASE_URL:}
-        invoke-path: ${AI_AGENT_MCP_ROUTE_INVOKE_PATH:/tools/invoke}
+        transport: ${AI_AGENT_MCP_ROUTE_TRANSPORT:mcp-sse}
+        invoke-path: ${AI_AGENT_MCP_ROUTE_INVOKE_PATH:/sse}
         api-key: ${AI_AGENT_MCP_ROUTE_API_KEY:}
         tool-name: ${AI_AGENT_MCP_ROUTE_TOOL_NAME:route_plan}
       weather:
         enabled: ${AI_AGENT_MCP_WEATHER_ENABLED:false}
         base-url: ${AI_AGENT_MCP_WEATHER_BASE_URL:}
-        invoke-path: ${AI_AGENT_MCP_WEATHER_INVOKE_PATH:/tools/invoke}
+        transport: ${AI_AGENT_MCP_WEATHER_TRANSPORT:mcp-sse}
+        invoke-path: ${AI_AGENT_MCP_WEATHER_INVOKE_PATH:/sse}
         api-key: ${AI_AGENT_MCP_WEATHER_API_KEY:}
         tool-name: ${AI_AGENT_MCP_WEATHER_TOOL_NAME:weather_brief}
+order:
+  timeout-recovery:
+    max-batches-per-run: ${ORDER_TIMEOUT_RECOVERY_MAX_BATCHES_PER_RUN:10}

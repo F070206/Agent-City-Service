@@ -4,14 +4,17 @@ import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
-import org.redisson.api.RScoredSortedSet;
-import org.redisson.api.RScript;
-import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.env.Environment;
+import org.springframework.core.env.Profiles;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.expression.ExpressionParser;
+import org.springframework.expression.Expression;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.stereotype.Component;
@@ -21,7 +24,8 @@ import org.springframework.web.context.request.ServletRequestAttributes;
 import jakarta.annotation.Resource;
 import java.lang.reflect.Method;
 import java.util.Collections;
-import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
 @Aspect
@@ -29,13 +33,38 @@ import java.util.concurrent.TimeUnit;
 @Order(Ordered.HIGHEST_PRECEDENCE + 20)
 public class SlidingWindowLimitAspect {
     @Resource
-    private RedissonClient redissonClient;
+    private StringRedisTemplate stringRedisTemplate;
+    @Resource
+    private Environment environment;
     private static final Logger log = LoggerFactory.getLogger(SlidingWindowLimitAspect.class);
 
     private static final String RATE_LIMIT_PREFIX = "rate_limit";
+    private static final DefaultRedisScript<Long> RATE_LIMIT_SCRIPT = createRateLimitScript();
+    private static final ExpressionParser EXPRESSION_PARSER = new SpelExpressionParser();
+    static final ConcurrentMap<String, Expression> EXPRESSION_CACHE = new ConcurrentHashMap<>();
+
+    private static DefaultRedisScript<Long> createRateLimitScript() {
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setLocation(new ClassPathResource("RateLimit.lua"));
+        script.setResultType(Long.class);
+        return script;
+    }
 
     @Around("@annotation(slidingWindowLimit)")
     public Object around(ProceedingJoinPoint joinPoint, SlidingWindowLimit slidingWindowLimit) throws Throwable {
+        return enforce(joinPoint, slidingWindowLimit);
+    }
+
+    @Around("@within(slidingWindowLimit)")
+    public Object aroundClass(ProceedingJoinPoint joinPoint, SlidingWindowLimit slidingWindowLimit) throws Throwable {
+        // Microservice public ingress has a shared Gateway limiter; retain method limits for expensive actions.
+        if (environment.acceptsProfiles(Profiles.of("micro")) && slidingWindowLimit.globalLimit()) {
+            return joinPoint.proceed();
+        }
+        return enforce(joinPoint, slidingWindowLimit);
+    }
+
+    private Object enforce(ProceedingJoinPoint joinPoint, SlidingWindowLimit slidingWindowLimit) throws Throwable {
         //获取方法签名
         MethodSignature signature = (MethodSignature) joinPoint.getSignature();
         Method method = signature.getMethod();
@@ -64,6 +93,10 @@ public class SlidingWindowLimitAspect {
 
     private Object parseSpEL(ProceedingJoinPoint joinPoint,MethodSignature signature, String keySpEL){
         StandardEvaluationContext context = new StandardEvaluationContext();
+        ServletRequestAttributes attributes = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+        if (attributes != null) {
+            context.setVariable("request", attributes.getRequest());
+        }
 
         Object[] args = joinPoint.getArgs();
         String[] parameterNames = signature.getParameterNames();
@@ -76,8 +109,11 @@ public class SlidingWindowLimitAspect {
             }
         }
 
-        ExpressionParser parser = new SpelExpressionParser();
-        return parser.parseExpression(keySpEL).getValue(context);
+        return expressionFor(keySpEL).getValue(context);
+    }
+
+    static Expression expressionFor(String keySpEL) {
+        return EXPRESSION_CACHE.computeIfAbsent(keySpEL, EXPRESSION_PARSER::parseExpression);
     }
 
     private String buildRateLimitKey(Object keyValue, SlidingWindowLimit slidingWindowLimit){
@@ -106,57 +142,19 @@ public class SlidingWindowLimitAspect {
     private boolean isRateLimited(String key, int windowSize, TimeUnit timeUnit, int maxRequests) {
         // 1. 计算窗口大小（毫秒）
         long windowMillis = convertToMillis(windowSize, timeUnit);
-        // 2. 获取当前时间和窗口起始时间
-        long currentTime = System.currentTimeMillis();
-        long windowStartTime = currentTime - windowMillis;
-        // 3. 生成唯一请求ID（避免重复计数）
-        String requestId = UUID.randomUUID().toString();
-        // 4. 计算过期时间（秒），兜底为60秒，避免负数
+        // 2. 计算过期时间（秒），兜底为60秒，避免负数
         long expireSeconds = Math.max(calculateExpireSeconds(windowMillis), 60);
 
-        // 5. 修复后的Lua脚本（核心：增加参数兜底+count类型转换）
-        String luaScript =
-                "-- 强制转换参数为浮点型，空值兜底\n" +
-                        "local currentTime = tonumber(ARGV[1]) or 0.0\n" +
-                        "local windowStartTime = tonumber(ARGV[2]) or 0.0\n" +
-                        "local requestId = ARGV[3] or ''\n" +
-                        "local maxRequests = tonumber(ARGV[4]) or 0.0\n" +
-                        "local expireSeconds = tonumber(ARGV[5]) or 60.0\n" +
-                        "\n" +
-                        "-- 清理窗口外的过期请求\n" +
-                        "redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', windowStartTime)\n" +
-                        "-- 统计窗口内请求数，转换为数字并兜底\n" +
-                        "local count = tonumber(redis.call('ZCOUNT', KEYS[1], windowStartTime, currentTime)) or 0.0\n" +
-                        "\n" +
-                        "-- 限流判断（maxRequests为0时直接放行，避免误限流）\n" +
-                        "if maxRequests > 0 and count >= maxRequests then\n" +
-                        "    return 1\n" +  // 触发限流
-                        "end\n" +
-                        "\n" +
-                        "-- 记录当前请求（分值为当前时间戳，确保浮点型）\n" +
-                        "redis.call('ZADD', KEYS[1], currentTime, requestId)\n" +
-                        "-- 设置过期时间（确保为正数）\n" +
-                        "redis.call('EXPIRE', KEYS[1], math.max(expireSeconds, 60))\n" +
-                        "return 0";  // 允许通过
-
         try {
-            RScript script = redissonClient.getScript();
-            Long result = script.eval(
-                    RScript.Mode.READ_WRITE,
-                    luaScript,
-                    RScript.ReturnType.INTEGER,
-                    Collections.singletonList(key),
-                    (double) currentTime,  // 浮点型传递
-                    (double) windowStartTime,
-                    requestId,
-                    (double) maxRequests,
-                    (double) expireSeconds
-            );
+            Long result = stringRedisTemplate.execute(RATE_LIMIT_SCRIPT, Collections.singletonList(key),
+                    Long.toString(windowMillis), Integer.toString(maxRequests), Long.toString(expireSeconds));
+            if (result == null || (result != 0 && result != 1)) {
+                throw new IllegalStateException("Rate limit script returned an invalid decision");
+            }
             // 返回true表示触发限流，false表示放行
-            return result != null && result == 1;
+            return result == 1;
         } catch (Exception e) {
-            log.error("限流服务异常，降级放行，key:{}", key, e);
-            return false; // Redis故障时允许请求通过
+            throw new RateLimitUnavailableException("Rate limit service is unavailable", e);
         }
     }
     private long calculateExpireSeconds(long windowMillis) {

@@ -3,6 +3,7 @@ import { cityOptions } from '@/mock/data';
 import { normalizeCategories, normalizeShop } from '@/utils/shop';
 
 const PAGE_SIZE = 10;
+const MAX_SHOP_RESULTS = 1000;
 
 export const homeApi = {
   async getCategories() {
@@ -48,7 +49,7 @@ export const homeApi = {
       currentTypeId,
       banners: shops.slice(0, 3),
       shops,
-      hasMore: shops.length >= PAGE_SIZE
+      hasMore: shops.length >= PAGE_SIZE && currentPage * PAGE_SIZE < MAX_SHOP_RESULTS
     };
   },
 
@@ -62,7 +63,8 @@ export const homeApi = {
         method: 'get',
         params: {
           typeId: params.category,
-          current: currentPage
+          current: currentPage,
+          name: (params.keyword || '').trim() || undefined
         }
       });
     } else {
@@ -78,7 +80,7 @@ export const homeApi = {
 
     return {
       list: (list || []).map((item) => normalizeShop(item)),
-      hasMore: (list || []).length >= PAGE_SIZE
+      hasMore: (list || []).length >= PAGE_SIZE && currentPage * PAGE_SIZE < MAX_SHOP_RESULTS
     };
   }
 };

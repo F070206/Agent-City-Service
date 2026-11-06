@@ -4,6 +4,9 @@ package com.hmdp.controller;
 import com.hmdp.dto.Result;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.SlidingWindowLimit;
+import com.hmdp.utils.UserHolder;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -27,6 +30,18 @@ public class VoucherOrderController {
 
     @Resource
     private IVoucherOrderService voucherOrderService;
+
+    @GetMapping("/my")
+    public Result myOrders(@RequestParam(value = "current", defaultValue = "1") Integer current) {
+        if (current == null || current < 1) {
+            return Result.fail("页码必须大于等于 1");
+        }
+        if (current > 50) {
+            return Result.fail("仅支持查询前1000条订单");
+        }
+        Long userId = UserHolder.getUser().getId();
+        return Result.ok(voucherOrderService.listUserOrders(userId, current));
+    }
 
     @PostMapping("/buy/{id}")
     public Result buyVoucher(@PathVariable("id") Long voucherId) {

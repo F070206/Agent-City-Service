@@ -7,9 +7,21 @@
       </div>
       <div class="header-actions">
         <el-button size="small" @click="aiStore.refreshConversationList()" :disabled="aiStore.pending">刷新</el-button>
-        <el-button size="small" type="primary" @click="aiStore.startNewConversation()" :disabled="aiStore.pending">新建</el-button>
+        <el-button size="small" type="primary" @click="aiStore.startNewConversation()" :loading="aiStore.conversationCreating" :disabled="aiStore.pending || aiStore.conversationCreating">新建</el-button>
       </div>
     </div>
+
+    <p v-if="aiStore.conversationListError" class="conversation-error" role="status">
+      {{ aiStore.conversationListError }}，可点击“刷新”重试
+    </p>
+    <p v-if="aiStore.conversationSwitchError" class="conversation-error" role="status">
+      {{ aiStore.conversationSwitchError }}
+      <el-button link type="primary" @click="retrySwitch">重试打开会话</el-button>
+    </p>
+    <p v-if="aiStore.conversationCreateError" class="conversation-error" role="status">
+      {{ aiStore.conversationCreateError }}
+      <el-button link type="primary" :disabled="aiStore.conversationCreating" @click="aiStore.startNewConversation()">重试新建</el-button>
+    </p>
 
     <div class="conversation-list" v-if="aiStore.conversations.length">
       <button
@@ -25,7 +37,9 @@
       </button>
     </div>
 
-    <div v-else class="empty-block">暂无历史会话，点击右上角可创建新会话</div>
+    <div v-if="!aiStore.conversations.length && !aiStore.conversationListError" class="empty-block">
+      暂无历史会话，点击右上角可创建新会话
+    </div>
   </section>
 </template>
 
@@ -55,6 +69,12 @@ function formatTime(value) {
   const minute = `${date.getMinutes()}`.padStart(2, '0');
   return `${month}-${day} ${hour}:${minute}`;
 }
+
+function retrySwitch() {
+  if (aiStore.failedConversationId != null) {
+    void aiStore.switchConversation(aiStore.failedConversationId);
+  }
+}
 </script>
 
 <style scoped lang="scss">
@@ -82,6 +102,12 @@ function formatTime(value) {
   margin: 6px 0 0;
   font-size: 12px;
   color: #999;
+}
+
+.conversation-error {
+  margin: 0;
+  color: #c45656;
+  font-size: 13px;
 }
 
 .header-actions {

@@ -32,8 +32,25 @@ CREATE TABLE `tb_blog`  (
   `comments` int(8) UNSIGNED NULL DEFAULT NULL COMMENT '评论数量',
   `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-  PRIMARY KEY (`id`) USING BTREE
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_blog_liked_id` (`liked`, `id`)
 ) ENGINE = InnoDB AUTO_INCREMENT = 8 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci ROW_FORMAT = Compact;
+
+CREATE TABLE `tb_blog_feed_dispatch` (
+  `blog_id` BIGINT UNSIGNED NOT NULL,
+  `follower_id` BIGINT UNSIGNED NOT NULL,
+  `delivered` TINYINT NOT NULL DEFAULT 0,
+  `attempts` INT NOT NULL DEFAULT 0,
+  `next_retry_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `claim_token` VARCHAR(36) NULL,
+  `claim_until` TIMESTAMP NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`blog_id`, `follower_id`),
+  KEY `idx_blog_feed_dispatch_retry` (`delivered`, `next_retry_time`, `claim_until`, `blog_id`, `follower_id`),
+  KEY `idx_blog_feed_dispatch_claim` (`claim_token`, `delivered`),
+  KEY `idx_blog_feed_dispatch_cleanup` (`delivered`, `updated_at`, `blog_id`, `follower_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ----------------------------
 -- Records of tb_blog
@@ -74,7 +91,9 @@ CREATE TABLE `tb_follow`  (
   `user_id` bigint(20) UNSIGNED NOT NULL COMMENT '用户id',
   `follow_user_id` bigint(20) UNSIGNED NOT NULL COMMENT '关联的用户id',
   `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-  PRIMARY KEY (`id`) USING BTREE
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_follow_user_target` (`user_id`, `follow_user_id`),
+  KEY `idx_follow_target_user` (`follow_user_id`, `user_id`)
 ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci ROW_FORMAT = Compact;
 
 -- ----------------------------
@@ -92,6 +111,7 @@ CREATE TABLE `tb_seckill_voucher`  (
   `begin_time` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00' COMMENT '生效时间',
   `end_time` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00' COMMENT '失效时间',
   `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  `activity_version` bigint(20) NOT NULL DEFAULT 0 COMMENT '秒杀活动元数据版本',
   PRIMARY KEY (`voucher_id`) USING BTREE
 ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '秒杀优惠券表，与优惠券是一对一关系' ROW_FORMAT = Compact;
 
@@ -110,8 +130,8 @@ CREATE TABLE `tb_shop`  (
   `images` varchar(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL COMMENT '商铺图片，多个图片以\',\'隔开',
   `area` varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NULL DEFAULT NULL COMMENT '商圈，例如陆家嘴',
   `address` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL COMMENT '地址',
-  `x` double UNSIGNED NOT NULL COMMENT '经度',
-  `y` double UNSIGNED NOT NULL COMMENT '维度',
+  `x` double NOT NULL COMMENT '经度',
+  `y` double NOT NULL COMMENT '维度',
   `avg_price` bigint(10) UNSIGNED NULL DEFAULT NULL COMMENT '均价，取整数',
   `sold` int(10) UNSIGNED NOT NULL COMMENT '销量',
   `comments` int(10) UNSIGNED NOT NULL COMMENT '评论数量',
@@ -232,7 +252,8 @@ CREATE TABLE `tb_voucher`  (
   `status` tinyint(1) UNSIGNED NOT NULL DEFAULT 1 COMMENT '1,上架; 2,下架; 3,过期',
   `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-  PRIMARY KEY (`id`) USING BTREE
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_voucher_shop_status` (`shop_id`, `status`)
 ) ENGINE = InnoDB AUTO_INCREMENT = 10 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci ROW_FORMAT = Compact;
 
 -- ----------------------------
@@ -243,6 +264,7 @@ INSERT INTO `tb_voucher` VALUES (1, 1, '50元代金券', '周一至周日均可�
 -- ----------------------------
 -- Table structure for tb_voucher_order
 -- ----------------------------
+DROP TABLE IF EXISTS `tb_seckill_order_guard`;
 DROP TABLE IF EXISTS `tb_voucher_order`;
 CREATE TABLE `tb_voucher_order`  (
   `id` bigint(20) NOT NULL COMMENT '主键',
@@ -255,11 +277,55 @@ CREATE TABLE `tb_voucher_order`  (
   `use_time` timestamp NULL DEFAULT NULL COMMENT '核销时间',
   `refund_time` timestamp NULL DEFAULT NULL COMMENT '退款时间',
   `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-  PRIMARY KEY (`id`) USING BTREE
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_voucher_order_timeout_recovery` (`status`, `create_time`)
 ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci ROW_FORMAT = Compact;
+
+CREATE TABLE `tb_seckill_order_guard` (
+  `user_id` bigint(20) UNSIGNED NOT NULL,
+  `voucher_id` bigint(20) UNSIGNED NOT NULL,
+  `active_order_id` bigint(20) NULL,
+  PRIMARY KEY (`user_id`, `voucher_id`),
+  UNIQUE KEY `uk_seckill_order_guard_order` (`active_order_id`)
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci;
 
 -- ----------------------------
 -- Records of tb_voucher_order
 -- ----------------------------
 
 SET FOREIGN_KEY_CHECKS = 1;
+
+CREATE TABLE IF NOT EXISTS tb_order_timeout_retry (
+    order_id BIGINT NOT NULL,
+    attempts INT NOT NULL DEFAULT 0,
+    next_retry_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    claim_token VARCHAR(36) NULL,
+    claim_until TIMESTAMP NULL,
+    create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (order_id),
+    KEY idx_timeout_retry_claim (next_retry_time, claim_until, order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS tb_seckill_order_dispatch (
+    order_id BIGINT NOT NULL,
+    user_id BIGINT UNSIGNED NOT NULL,
+    payload TEXT NOT NULL,
+    completed TINYINT NOT NULL DEFAULT 0,
+    attempts INT NOT NULL DEFAULT 0,
+    next_retry_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    timeout_sent TINYINT NOT NULL DEFAULT 0,
+    timeout_attempts INT NOT NULL DEFAULT 0,
+    timeout_retry_time TIMESTAMP NULL,
+    timeout_claim_token VARCHAR(36) NULL,
+    timeout_claim_until TIMESTAMP NULL,
+    claim_token VARCHAR(36) NULL,
+    claim_until TIMESTAMP NULL,
+    create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (order_id),
+    KEY idx_dispatch_retry (completed, next_retry_time, order_id),
+    KEY idx_dispatch_claim (claim_token, completed),
+    KEY idx_dispatch_lease (completed, claim_until, next_retry_time, order_id),
+    KEY idx_dispatch_timeout_claim (timeout_sent, timeout_retry_time, timeout_claim_until, order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

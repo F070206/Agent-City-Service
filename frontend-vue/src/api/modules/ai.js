@@ -75,7 +75,7 @@ export const aiApi = {
       method: 'get'
     });
   },
-  async streamConversation(conversationId, { signal, onEvent } = {}) {
+  async streamConversation(conversationId, { signal, onEvent, onOpen } = {}) {
     const token = localStorage.getItem('hm-dianping-token');
     const response = await fetch(buildApiPath(`/ai/agent/conversations/${conversationId}/stream`), {
       method: 'GET',
@@ -86,9 +86,24 @@ export const aiApi = {
       signal
     });
 
-    if (!response.ok || !response.body) {
-      throw new Error('建立 AI 流式连接失败');
+    if (!response.ok) {
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch {
+        // Keep a useful status-based fallback when a proxy returns a non-JSON error.
+      }
+      const error = new Error(payload?.errorMsg || `建立 AI 流式连接失败（HTTP ${response.status}）`);
+      error.response = { status: response.status, data: payload };
+      throw error;
     }
+    if (!response.body) {
+      const error = new Error('建立 AI 流式连接失败');
+      error.response = { status: response.status };
+      throw error;
+    }
+
+    onOpen?.();
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder('utf-8');

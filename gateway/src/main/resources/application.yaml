@@ -1,0 +1,95 @@
+server:
+  port: 8083
+management:
+  server:
+    port: ${MANAGEMENT_SERVER_PORT:8086}
+    address: 127.0.0.1
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,redis,nacosDiscovery
+cityai:
+  gateway:
+    trusted-proxies: ${GATEWAY_TRUSTED_PROXIES:}
+spring:
+  application:
+    name: cityai-gateway
+  web:
+    resources:
+      static-locations:
+        - ${CITYAI_GATEWAY_STATIC_LOCATION:file:/app/static/}
+        - file:/app/uploads/
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${SPRING_DATA_REDIS_PASSWORD:}
+  cloud:
+    loadbalancer:
+      cache:
+        enabled: false
+    nacos:
+      discovery:
+        server-addr: ${NACOS_SERVER_ADDR:localhost:8848}
+    gateway:
+      httpclient:
+        connect-timeout: ${GATEWAY_CONNECT_TIMEOUT_MS:2000}
+        response-timeout: 120s
+      routes:
+        - id: user-auth
+          uri: lb://cityai-user
+          predicates:
+            - Path=/user/code,/user/login
+          filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@businessKeyResolver}"
+                redis-rate-limiter.replenishRate: ${GATEWAY_AUTH_RATE:1}
+                redis-rate-limiter.burstCapacity: ${GATEWAY_AUTH_BURST:5}
+        - id: user
+          uri: lb://cityai-user
+          predicates:
+            - Path=/user/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@businessKeyResolver}"
+                redis-rate-limiter.replenishRate: ${GATEWAY_USER_RATE:10}
+                redis-rate-limiter.burstCapacity: ${GATEWAY_USER_BURST:20}
+        - id: content
+          uri: lb://cityai-content
+          predicates:
+            - Path=/shop/**,/shop-type/**,/blog/**,/blog-comments/**,/follow/**,/upload/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@businessKeyResolver}"
+                redis-rate-limiter.replenishRate: ${GATEWAY_CONTENT_RATE:50}
+                redis-rate-limiter.burstCapacity: ${GATEWAY_CONTENT_BURST:100}
+        - id: order
+          uri: lb://cityai-order
+          predicates:
+            - Path=/voucher/**,/voucher-order/**,/payment/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@businessKeyResolver}"
+                redis-rate-limiter.replenishRate: ${GATEWAY_ORDER_RATE:10}
+                redis-rate-limiter.burstCapacity: ${GATEWAY_ORDER_BURST:20}
+        - id: ai
+          uri: lb://cityai-ai
+          predicates:
+            - Path=/ai/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@businessKeyResolver}"
+                redis-rate-limiter.replenishRate: ${GATEWAY_AI_RATE:2}
+                redis-rate-limiter.burstCapacity: ${GATEWAY_AI_BURST:4}

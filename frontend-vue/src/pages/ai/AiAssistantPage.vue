@@ -8,7 +8,7 @@
         </div>
         <div class="hero-actions">
           <el-button @click="aiStore.startNewConversation()">新建会话</el-button>
-          <el-button @click="aiStore.clearHistory()">清空窗口</el-button>
+          <el-button :disabled="aiStore.pending" @click="aiStore.clearHistory()">清空窗口</el-button>
           <el-button type="primary" @click="quickAsk('推荐附近美食')">一键推荐</el-button>
         </div>
       </section>
@@ -47,13 +47,14 @@
             <el-input
               v-model="inputValue"
               type="textarea"
+              :maxlength="8000"
               :autosize="{ minRows: 3, maxRows: 5 }"
               resize="none"
               placeholder="例如：北京朝阳区火锅推荐"
               @keydown.enter.prevent="submitMessage"
             />
             <div class="editor-actions">
-              <el-button type="primary" :loading="aiStore.pending" @click="submitMessage">
+              <el-button type="primary" :loading="aiStore.pending" :disabled="aiStore.pending" @click="submitMessage">
                 发送
               </el-button>
             </div>
@@ -82,6 +83,9 @@ onMounted(() => {
 });
 
 async function submitMessage() {
+  if (aiStore.pending) {
+    return;
+  }
   const content = inputValue.value.trim();
   if (!content) {
     return;

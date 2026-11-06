@@ -11,11 +11,16 @@ const service = axios.create({
   timeout: 8000
 });
 
+const TOKEN_KEY = 'hm-dianping-token';
+
 service.interceptors.request.use((config) => {
-  const token = localStorage.getItem('hm-dianping-token');
+  const token = typeof config.__authTokenOverride === 'string'
+    ? config.__authTokenOverride
+    : localStorage.getItem(TOKEN_KEY);
   config.headers = config.headers || {};
   if (token) {
     config.headers.authorization = token;
+    config.__authToken = token;
   }
   return config;
 });
@@ -25,16 +30,27 @@ service.interceptors.response.use(
     const payload = response.data;
     if (payload && typeof payload.success === 'boolean') {
       if (!payload.success) {
-        return Promise.reject(new Error(payload.errorMsg || '请求失败'));
+        const error = new Error(payload.errorMsg || '请求失败');
+        error.data = payload.data;
+        error.isBackendRejection = true;
+        return Promise.reject(error);
       }
       return payload.data;
     }
     return payload;
   },
   (error) => {
-    if (error?.response?.status === 401) {
-      localStorage.removeItem('hm-dianping-token');
-      window.dispatchEvent(new CustomEvent('hm-auth-expired'));
+    const payload = error?.response?.data;
+    if (payload && typeof payload.success === 'boolean' && payload.success === false
+        && typeof payload.errorMsg === 'string' && payload.errorMsg.trim()) {
+      error.message = payload.errorMsg;
+      error.data = payload.data;
+    }
+    const requestToken = error?.config?.__authToken;
+    if (error?.response?.status === 401 && requestToken
+        && localStorage.getItem(TOKEN_KEY) === requestToken) {
+      localStorage.removeItem(TOKEN_KEY);
+      window.dispatchEvent(new CustomEvent('hm-auth-expired', { detail: { token: requestToken } }));
     }
     return Promise.reject(error);
   }

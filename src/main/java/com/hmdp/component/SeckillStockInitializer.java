@@ -1,10 +1,9 @@
 package com.hmdp.component;
 
-import com.hmdp.entity.SeckillVoucher;
-import com.hmdp.service.ISeckillVoucherService;
+import com.hmdp.dto.SeckillVoucherLookup;
+import com.hmdp.mapper.SeckillVoucherMapper;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.ApplicationArguments;
-import org.springframework.boot.ApplicationRunner;
+import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
@@ -18,34 +17,47 @@ import static com.hmdp.utils.RedisConstants.SECKILL_STOCK_KEY;
  */
 @Component
 @Slf4j
-public class SeckillStockInitializer implements ApplicationRunner {
+public class SeckillStockInitializer implements SmartInitializingSingleton {
 
     @Resource
-    private ISeckillVoucherService seckillVoucherService;
+    private SeckillVoucherMapper seckillVoucherMapper;
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
+    @Resource
+    private SeckillActivityCache seckillActivityCache;
+    @Resource
+    private SeckillStockRecovery seckillStockRecovery;
 
     @Override
-    public void run(ApplicationArguments args) {
+    public void afterSingletonsInstantiated() {
         try {
-            List<SeckillVoucher> vouchers = seckillVoucherService.list();
+            List<SeckillVoucherLookup> vouchers = seckillVoucherMapper.findAllForSeckill();
             if (vouchers == null || vouchers.isEmpty()) {
                 log.info("未查询到秒杀券数据，跳过秒杀库存预热");
                 return;
             }
-            for (SeckillVoucher voucher : vouchers) {
-                if (voucher.getVoucherId() == null || voucher.getStock() == null) {
+            int initialized = 0;
+            int needsReconciliation = 0;
+            for (SeckillVoucherLookup voucher : vouchers) {
+                if (voucher.getVoucherId() == null) {
                     continue;
                 }
-                stringRedisTemplate.opsForValue().set(
-                        SECKILL_STOCK_KEY + voucher.getVoucherId(),
-                        voucher.getStock().toString()
-                );
+                Long voucherId = voucher.getVoucherId();
+                String stockKey = SECKILL_STOCK_KEY + voucherId;
+                if (voucher.getStock() != null && stringRedisTemplate.opsForValue().get(stockKey) == null) {
+                    if (seckillStockRecovery.recoverMissingStock(voucher)) {
+                        initialized++;
+                    } else {
+                        needsReconciliation++;
+                    }
+                }
+                seckillActivityCache.put(voucher);
             }
-            log.info("秒杀库存预热完成，共同步 {} 条库存记录", vouchers.size());
+            log.info("秒杀库存预热完成，新增 {} 条，需人工对账 {} 条", initialized, needsReconciliation);
         } catch (Exception e) {
             log.error("秒杀库存预热失败", e);
+            throw new IllegalStateException("秒杀库存预热失败", e);
         }
     }
 }

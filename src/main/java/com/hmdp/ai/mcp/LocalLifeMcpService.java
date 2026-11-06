@@ -3,10 +3,11 @@ package com.hmdp.ai.mcp;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hmdp.ai.config.AiAgentProperties;
+import com.hmdp.ai.config.AiDependencyGuard;
 import com.hmdp.ai.dto.RouteAdviceDTO;
 import com.hmdp.ai.dto.WeatherDiningAdviceDTO;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import jakarta.annotation.PreDestroy;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
@@ -15,12 +16,12 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.time.LocalDate;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /**
@@ -31,14 +32,26 @@ import java.util.function.Supplier;
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class LocalLifeMcpService {
 
     private final AiAgentProperties aiAgentProperties;
 
     private final ObjectMapper objectMapper;
 
+    private final McpSseToolClient mcpSseClient;
+
     private final HttpClient httpClient = HttpClient.newBuilder().build();
+
+    public LocalLifeMcpService(AiAgentProperties aiAgentProperties, ObjectMapper objectMapper) {
+        this.aiAgentProperties = aiAgentProperties;
+        this.objectMapper = objectMapper;
+        this.mcpSseClient = new McpSseToolClient(objectMapper);
+    }
+
+    @PreDestroy
+    public void close() {
+        mcpSseClient.close();
+    }
 
     public RouteAdviceDTO routeAdvice(String destinationName,
                                       String destinationAddress,
@@ -59,7 +72,8 @@ public class LocalLifeMcpService {
                 aiAgentProperties.getMcp().getRoute().getToolName(),
                 arguments,
                 RouteAdviceDTO.class,
-                () -> buildRouteFallback(destinationName, destinationAddress, userX, userY, shopX, shopY)
+                () -> buildRouteFallback(destinationName, destinationAddress, userX, userY, shopX, shopY),
+                this::hasRouteContent
         );
     }
 
@@ -74,7 +88,8 @@ public class LocalLifeMcpService {
                 aiAgentProperties.getMcp().getWeather().getToolName(),
                 arguments,
                 WeatherDiningAdviceDTO.class,
-                () -> buildWeatherFallback(city, diningScene)
+                () -> buildWeatherFallback(city, diningScene),
+                this::hasWeatherContent
         );
     }
 
@@ -83,7 +98,8 @@ public class LocalLifeMcpService {
                                      String toolName,
                                      Map<String, Object> arguments,
                                      Class<T> resultType,
-                                     Supplier<T> fallbackSupplier) {
+                                     Supplier<T> fallbackSupplier,
+                                     Predicate<T> remoteResultValid) {
         if (!aiAgentProperties.getMcp().isEnabled()) {
             return fallbackSupplier.get();
         }
@@ -96,32 +112,73 @@ public class LocalLifeMcpService {
         }
 
         try {
-            JsonNode resultNode = invokeRemote(serverName, server, toolName, arguments);
-            if (resultNode == null || resultNode.isNull() || resultNode.isMissingNode()) {
-                return fallbackSupplier.get();
-            }
-            T result = objectMapper.convertValue(resultNode, resultType);
-            if (result == null) {
-                return fallbackSupplier.get();
-            }
-            return result;
+            return AiDependencyGuard.call("ai:mcp:" + serverName, () -> {
+                JsonNode resultNode = invokeRemote(serverName, server, toolName, arguments);
+                if (resultNode == null || resultNode.isNull() || resultNode.isMissingNode()) {
+                    throw new IllegalStateException("MCP tool returned an empty result: " + toolName);
+                }
+                T result = objectMapper.convertValue(resultNode, resultType);
+                if (result == null || !remoteResultValid.test(result)) {
+                    throw new IllegalStateException("MCP tool returned an incomplete result: " + toolName);
+                }
+                return result;
+            });
         } catch (Exception e) {
+            if (isInterrupted(e)) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("MCP 调用被中断：" + serverName, e);
+            }
             log.warn("MCP invoke failed, server={}, tool={}, fallback to local tool: {}", serverName, toolName, e.getMessage());
             return fallbackSupplier.get();
         }
+    }
+
+    private boolean isInterrupted(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof InterruptedException) {
+                return true;
+            }
+            if (current.getCause() == current) {
+                break;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private boolean hasRouteContent(RouteAdviceDTO result) {
+        return StringUtils.hasText(result.getRouteSummary())
+                || result.getDistanceMeters() != null
+                || StringUtils.hasText(result.getTravelMode())
+                || StringUtils.hasText(result.getDurationSuggestion());
+    }
+
+    private boolean hasWeatherContent(WeatherDiningAdviceDTO result) {
+        return StringUtils.hasText(result.getWeatherSummary())
+                || StringUtils.hasText(result.getDiningSuggestion())
+                || (result.getSuitableCategories() != null && !result.getSuitableCategories().isEmpty())
+                || (result.getReminders() != null && !result.getReminders().isEmpty());
     }
 
     private JsonNode invokeRemote(String serverName,
                                   AiAgentProperties.McpServer server,
                                   String toolName,
                                   Map<String, Object> arguments) throws Exception {
+        if ("mcp-sse".equalsIgnoreCase(server.getTransport())) {
+            return mcpSseClient.call(serverName, server, toolName, arguments,
+                    aiAgentProperties.getMcp().getTimeoutMillis());
+        }
+        if (!"legacy-http".equalsIgnoreCase(server.getTransport())) {
+            throw new IllegalArgumentException("Unsupported MCP transport: " + server.getTransport());
+        }
         Map<String, Object> requestBody = new LinkedHashMap<>();
         requestBody.put("tool", toolName);
         requestBody.put("arguments", arguments);
 
         String invokeUrl = normalizeUrl(server.getBaseUrl(), server.getInvokePath());
         HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(invokeUrl))
-                .timeout(Duration.ofMillis(Math.max(aiAgentProperties.getMcp().getTimeoutMillis(), 500)))
+                .timeout(McpTimeouts.boundedDuration(aiAgentProperties.getMcp().getTimeoutMillis()))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
                 .header("X-MCP-Server", serverName)

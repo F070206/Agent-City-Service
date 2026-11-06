@@ -33,14 +33,15 @@
         <el-input
           v-model="inputValue"
           type="textarea"
+          :maxlength="8000"
           :autosize="{ minRows: 2, maxRows: 4 }"
           resize="none"
           placeholder="输入你的美食问题，回车发送"
           @keydown.enter.prevent="submitMessage"
         />
         <div class="actions">
-          <el-button @click="aiStore.clearHistory()">清空窗口</el-button>
-          <el-button type="primary" :loading="aiStore.pending" @click="submitMessage">
+          <el-button :disabled="aiStore.pending" @click="aiStore.clearHistory()">清空窗口</el-button>
+          <el-button type="primary" :loading="aiStore.pending" :disabled="aiStore.pending" @click="submitMessage">
             发送
           </el-button>
         </div>
@@ -70,6 +71,9 @@ watch(
 );
 
 async function submitMessage() {
+  if (aiStore.pending) {
+    return;
+  }
   const content = inputValue.value.trim();
   if (!content) {
     return;

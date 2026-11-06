@@ -3,6 +3,8 @@ package com.hmdp.service;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.VoucherOrder;
 import com.baomidou.mybatisplus.extension.service.IService;
+import java.util.List;
+import com.hmdp.dto.OrderHistoryItem;
 
 /**
  * <p>
@@ -21,4 +23,6 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
     void createVoucherOrder(VoucherOrder voucherOrder);
 
     void closeTimeoutOrder(Long orderId);
+
+    List<OrderHistoryItem> listUserOrders(Long userId, Integer current);
 }

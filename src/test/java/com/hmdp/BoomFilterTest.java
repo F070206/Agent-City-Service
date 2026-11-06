@@ -3,9 +3,11 @@ package com.hmdp;
 import org.junit.jupiter.api.Test;
 import org.redisson.api.RBloomFilter;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import jakarta.annotation.Resource;
 @SpringBootTest
+@EnabledIfEnvironmentVariable(named = "CITYAI_RUN_LEGACY_INTEGRATION_TESTS", matches = "true")
 public class BoomFilterTest {
     @Resource
     private RBloomFilter<Long> shopBloomFilter;

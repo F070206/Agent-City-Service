@@ -14,7 +14,11 @@ import com.baomidou.mybatisplus.extension.service.IService;
  */
 public interface IBlogService extends IService<Blog> {
 
+    boolean ownsImage(Long userId, String filename);
+
     Result queryHotBlog(Integer current);
+
+    Result queryBlogByShopId(Long shopId, Integer current);
 
     Result queryBlogById(Long id);
 

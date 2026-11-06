@@ -1,6 +1,8 @@
 package com.hmdp.ai.rag.retriever;
 
 import com.hmdp.ai.config.AiAgentProperties;
+import com.hmdp.ai.config.AiInputLimits;
+import com.hmdp.ai.config.AiDependencyGuard;
 import com.hmdp.ai.dto.BlogVectorHitDTO;
 import com.hmdp.ai.dto.KnowledgeHitDTO;
 import com.hmdp.ai.dto.ShopToolDTO;
@@ -14,16 +16,19 @@ import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.ResourcePatternResolver;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.nio.charset.StandardCharsets;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -49,19 +54,40 @@ public class AiRagRetriever {
     @Qualifier("blogReviewVectorStore")
     private final VectorStore blogReviewVectorStore;
 
+    private final Object fallbackCorpusLock = new Object();
+    private final ResourcePatternResolver resourceResolver = new PathMatchingResourcePatternResolver();
+    private volatile List<KnowledgePassage> fallbackCorpus;
+
     public List<KnowledgeHitDTO> searchKnowledge(String query) {
         return searchKnowledge(query, null);
     }
 
     public List<KnowledgeHitDTO> searchKnowledge(String query, Filter.Expression filterExpression) {
+        validateQueryLength(query);
         Set<String> keywords = extractKeywords(query);
         // 先走向量召回，再用关键词兜底补强平台规则这类高确定性知识。
-        List<KnowledgeHitDTO> vectorHits = knowledgeVectorStore.similaritySearch(
-                        buildSearchRequest(query, aiAgentProperties.getRag().getTopK(), aiAgentProperties.getRag().getKnowledgeSimilarityThreshold(), filterExpression))
-                .stream()
-                .map(this::toKnowledgeHit)
-                .toList();
-        List<KnowledgeHitDTO> fallbackHits = keywordFallbackKnowledgeSearch(query, keywords);
+        List<KnowledgeHitDTO> vectorHits;
+        try {
+            vectorHits = searchVector(knowledgeVectorStore,
+                            buildSearchRequest(query, resolvedTopK(null),
+                                    aiAgentProperties.getRag().getKnowledgeSimilarityThreshold(), filterExpression))
+                    .stream()
+                    .map(this::toKnowledgeHit)
+                    .toList();
+        } catch (RuntimeException e) {
+            // 本地文本无法执行向量库的任意元数据过滤条件。
+            if (filterExpression != null) {
+                throw e;
+            }
+            List<KnowledgeHitDTO> fallbackHits = keywordFallbackKnowledgeSearch(query, keywords);
+            if (fallbackHits.isEmpty()) {
+                throw e;
+            }
+            log.warn("Knowledge vector search failed; using local keyword fallback", e);
+            return fallbackHits;
+        }
+        List<KnowledgeHitDTO> fallbackHits = filterExpression == null
+                ? keywordFallbackKnowledgeSearch(query, keywords) : List.of();
         if (!fallbackHits.isEmpty()) {
             List<KnowledgeHitDTO> relevantVectorHits = vectorHits.stream()
                     .filter(hit -> keywordScore(hit.getContent(), keywords) > 0)
@@ -79,40 +105,47 @@ public class AiRagRetriever {
     }
 
     public List<ShopToolDTO> searchShopProfiles(String query, Integer topK) {
-        int finalTopK = topK == null || topK <= 0 ? aiAgentProperties.getRag().getTopK() : topK;
-        return shopProfileVectorStore.similaritySearch(buildSearchRequest(query, finalTopK, null))
+        validateQueryLength(query);
+        int finalTopK = resolvedTopK(topK);
+        return searchVector(shopProfileVectorStore, buildSearchRequest(query, finalTopK, null))
                 .stream()
                 .map(this::toShopHit)
                 .toList();
     }
 
     public List<BlogVectorHitDTO> searchBlogReviews(String query, Integer topK) {
-        int finalTopK = topK == null || topK <= 0 ? aiAgentProperties.getRag().getTopK() : topK;
-        return blogReviewVectorStore.similaritySearch(buildSearchRequest(query, finalTopK, null))
+        validateQueryLength(query);
+        int finalTopK = resolvedTopK(topK);
+        return searchVector(blogReviewVectorStore, buildSearchRequest(query, finalTopK, null))
                 .stream()
                 .map(this::toBlogHit)
                 .toList();
     }
 
     public List<BlogVectorHitDTO> searchBlogReviewsByShop(Long shopId, String query, Integer topK) {
+        validateQueryLength(query);
         Filter.Expression filterExpression = new FilterExpressionBuilder().eq(AiMetadataConstants.SHOP_ID, shopId).build();
-        int finalTopK = topK == null || topK <= 0 ? aiAgentProperties.getRag().getTopK() : topK;
-        return blogReviewVectorStore.similaritySearch(buildSearchRequest(query, finalTopK, null, filterExpression))
+        int finalTopK = resolvedTopK(topK);
+        return searchVector(blogReviewVectorStore, buildSearchRequest(query, finalTopK, null, filterExpression))
                 .stream()
                 .map(this::toBlogHit)
                 .toList();
     }
 
     public boolean hasKnowledgeDocuments() {
-        return !knowledgeVectorStore.similaritySearch(buildSearchRequest("同城生活服务平台", 1, aiAgentProperties.getRag().getKnowledgeSimilarityThreshold(), null)).isEmpty();
+        return !searchVector(knowledgeVectorStore, buildSearchRequest("同城生活服务平台", 1, null, null)).isEmpty();
     }
 
     public boolean hasShopProfileDocuments() {
-        return !shopProfileVectorStore.similaritySearch(buildSearchRequest("推荐店铺", 1, null)).isEmpty();
+        return !searchVector(shopProfileVectorStore, buildSearchRequest("推荐店铺", 1, null, null)).isEmpty();
     }
 
     public boolean hasBlogReviewDocuments() {
-        return !blogReviewVectorStore.similaritySearch(buildSearchRequest("探店评价", 1, null)).isEmpty();
+        return !searchVector(blogReviewVectorStore, buildSearchRequest("探店评价", 1, null, null)).isEmpty();
+    }
+
+    private List<Document> searchVector(VectorStore vectorStore, SearchRequest request) {
+        return AiDependencyGuard.callUnchecked("ai:rag:search", () -> vectorStore.similaritySearch(request));
     }
 
     private SearchRequest buildSearchRequest(String query, int topK, Filter.Expression filterExpression) {
@@ -122,7 +155,7 @@ public class AiRagRetriever {
     private SearchRequest buildSearchRequest(String query, int topK, Double similarityThreshold, Filter.Expression filterExpression) {
         SearchRequest.Builder builder = SearchRequest.builder()
                 .query(StringUtils.hasText(query) ? query : "同城生活服务平台")
-                .topK(topK);
+                .topK(resolvedTopK(topK));
         if (similarityThreshold != null) {
             builder.similarityThreshold(similarityThreshold);
         }
@@ -132,6 +165,19 @@ public class AiRagRetriever {
         return builder.build();
     }
 
+    private int resolvedTopK(Integer requestedTopK) {
+        int maximum = Math.max(aiAgentProperties.getRag().getMaxTopK(), 1);
+        int requested = requestedTopK == null || requestedTopK <= 0
+                ? aiAgentProperties.getRag().getTopK() : requestedTopK;
+        return Math.min(Math.max(requested, 1), maximum);
+    }
+
+    private void validateQueryLength(String query) {
+        if (query != null && query.length() > AiInputLimits.MAX_QUERY_CHARS) {
+            throw new IllegalArgumentException("RAG 查询不能超过 " + AiInputLimits.MAX_QUERY_CHARS + " 个字符");
+        }
+    }
+
     private List<KnowledgeHitDTO> keywordFallbackKnowledgeSearch(String query, Set<String> keywords) {
         if (!StringUtils.hasText(query) || keywords.isEmpty()) {
             return List.of();
@@ -139,28 +185,18 @@ public class AiRagRetriever {
 
         // 兜底方案直接扫 classpath 下的知识文本，避免向量库弱召回时“明明有文档却答不上来”。
         List<KnowledgeHitDTO> results = new ArrayList<>();
-        PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
         try {
-            Resource[] resources = resolver.getResources("classpath:knowledge/*.txt");
-            for (Resource resource : resources) {
-                String text = new String(resource.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-                String[] passages = text.split("(\\r?\\n){2,}");
-                for (int i = 0; i < passages.length; i++) {
-                    String passage = passages[i].trim();
-                    if (!StringUtils.hasText(passage)) {
-                        continue;
-                    }
-                    int score = keywordScore(passage, keywords);
-                    if (score <= 0) {
-                        continue;
-                    }
-                    KnowledgeHitDTO dto = new KnowledgeHitDTO();
-                    dto.setId(resource.getFilename() + "#fallback-" + i);
-                    dto.setSourceId(resource.getFilename() + "#fallback-" + i);
-                    dto.setContent(passage);
-                    dto.setScore((double) score);
-                    results.add(dto);
+            for (KnowledgePassage item : loadFallbackCorpus()) {
+                int score = keywordScore(item.content(), keywords);
+                if (score <= 0) {
+                    continue;
                 }
+                KnowledgeHitDTO dto = new KnowledgeHitDTO();
+                dto.setId(item.sourceId());
+                dto.setSourceId(item.sourceId());
+                dto.setContent(item.content());
+                dto.setScore((double) score);
+                results.add(dto);
             }
         }
         catch (Exception e) {
@@ -170,8 +206,42 @@ public class AiRagRetriever {
 
         return results.stream()
                 .sorted(Comparator.comparing(KnowledgeHitDTO::getScore, Comparator.nullsLast(Double::compareTo)).reversed())
-                .limit(aiAgentProperties.getRag().getTopK())
+                .limit(resolvedTopK(null))
                 .toList();
+    }
+
+    private List<KnowledgePassage> loadFallbackCorpus() throws Exception {
+        List<KnowledgePassage> cached = fallbackCorpus;
+        if (cached != null) {
+            return cached;
+        }
+        synchronized (fallbackCorpusLock) {
+            cached = fallbackCorpus;
+            if (cached != null) {
+                return cached;
+            }
+            List<KnowledgePassage> passages = new ArrayList<>();
+            Resource[] resources = resourceResolver.getResources("classpath:knowledge/*.txt");
+            for (Resource resource : resources) {
+                String text;
+                try (InputStream input = resource.getInputStream()) {
+                    text = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+                }
+                String[] sections = text.split("(\\r?\\n){2,}");
+                for (int i = 0; i < sections.length; i++) {
+                    String passage = sections[i].trim();
+                    if (StringUtils.hasText(passage)) {
+                        passages.add(new KnowledgePassage(resource.getFilename() + "#fallback-" + i, passage));
+                    }
+                }
+            }
+            cached = List.copyOf(passages);
+            fallbackCorpus = cached;
+            return cached;
+        }
+    }
+
+    private record KnowledgePassage(String sourceId, String content) {
     }
 
     private List<KnowledgeHitDTO> mergeKnowledgeHits(List<KnowledgeHitDTO> vectorHits,
@@ -194,7 +264,7 @@ public class AiRagRetriever {
                         .<KnowledgeHitDTO>comparingInt(hit -> keywordScore(hit.getContent(), keywords))
                         .reversed()
                         .thenComparing(KnowledgeHitDTO::getScore, Comparator.nullsLast(Comparator.reverseOrder())))
-                .limit(aiAgentProperties.getRag().getTopK())
+                .limit(resolvedTopK(null))
                 .toList();
     }
 
@@ -216,6 +286,9 @@ public class AiRagRetriever {
     }
 
     private Set<String> extractKeywords(String query) {
+        if (!StringUtils.hasText(query)) {
+            return Set.of();
+        }
         String normalized = query.replaceAll("[^\\p{IsHan}A-Za-z0-9]", "");
         if (!StringUtils.hasText(normalized)) {
             return Set.of();
@@ -267,10 +340,14 @@ public class AiRagRetriever {
     }
 
     private int keywordScore(String passage, Set<String> keywords) {
+        if (!StringUtils.hasText(passage) || keywords == null || keywords.isEmpty()) {
+            return 0;
+        }
+        String normalizedPassage = passage.toLowerCase(Locale.ROOT);
         return keywords.stream()
                 .filter(Objects::nonNull)
                 .filter(keyword -> keyword.length() >= 2)
-                .mapToInt(keyword -> passage.contains(keyword) ? 1 : 0)
+                .mapToInt(keyword -> normalizedPassage.contains(keyword.toLowerCase(Locale.ROOT)) ? 1 : 0)
                 .sum();
     }
 

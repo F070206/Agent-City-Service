@@ -7,12 +7,15 @@ import com.hmdp.ai.agent.loop.AgentLoopResult;
 import com.hmdp.ai.agent.loop.AgentLoopStatus;
 import com.hmdp.ai.agent.scene.AiAgentScene;
 import com.hmdp.ai.config.AiAgentProperties;
+import com.hmdp.ai.config.AiInputLimits;
 import com.hmdp.ai.dto.AgentRecommendRequest;
 import com.hmdp.ai.dto.AgentRecommendResponse;
 import com.hmdp.ai.dto.ConversationSummaryDTO;
 import com.hmdp.ai.dto.IndexRebuildResponse;
 import com.hmdp.ai.dto.MessageDTO;
 import com.hmdp.ai.dto.ShopInsightResponse;
+import com.hmdp.ai.entity.AiTask;
+import com.hmdp.ai.mapper.AiTaskMapper;
 import com.hmdp.ai.memory.ConversationMemoryService;
 import com.hmdp.ai.rag.indexer.AiVectorIndexService;
 import com.hmdp.ai.service.AiAgentService;
@@ -24,6 +27,7 @@ import com.hmdp.service.ChatSseService;
 import com.hmdp.utils.UserHolder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import jakarta.annotation.Resource;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -49,6 +53,9 @@ public class AiAgentServiceImpl implements AiAgentService {
 
     private final ChatSseService chatSseService;
 
+    @Resource
+    private AiTaskMapper aiTaskMapper;
+
     @Override
     @Transactional
     public ConversationSummaryDTO createConversation() {
@@ -68,6 +75,8 @@ public class AiAgentServiceImpl implements AiAgentService {
         if (request == null || !StringUtils.hasText(request.getContent())) {
             throw new IllegalArgumentException("content 不能为空");
         }
+        validatePromptLength(request.getContent());
+        validateOptionalCoordinates(request.getX(), request.getY());
 
         var conversation = conversationMemoryService.getOrCreateConversation(
                 userId,
@@ -76,6 +85,16 @@ public class AiAgentServiceImpl implements AiAgentService {
                 AiAgentScene.MULTI_AGENT.name()
         );
         var chatMessage = conversationMemoryService.appendUserMessage(conversation.getId(), request.getContent());
+        AiTask task = new AiTask();
+        task.setMessageId(chatMessage.getId());
+        task.setConversationId(conversation.getId());
+        task.setUserId(userId);
+        task.setContent(chatMessage.getContent());
+        task.setX(request.getX());
+        task.setY(request.getY());
+        if (aiTaskMapper.insertTask(task) != 1) {
+            throw new IllegalStateException("保存 AI 任务失败，消息ID=" + chatMessage.getId());
+        }
         applicationEventPublisher.publishEvent(new ChatMessageCreatedEvent(
                 userId,
                 conversation.getId(),
@@ -109,6 +128,11 @@ public class AiAgentServiceImpl implements AiAgentService {
 
     @Override
     public AgentRecommendResponse recommend(AgentRecommendRequest request) {
+        if (request == null) {
+            throw new IllegalArgumentException("推荐请求不能为空");
+        }
+        validatePromptLength(request.getQuery());
+        validateOptionalCoordinates(request.getX(), request.getY());
         AgentLoopRequest loopRequest = new AgentLoopRequest();
         loopRequest.setPrompt(request.getQuery());
         loopRequest.setX(request.getX());
@@ -157,6 +181,20 @@ public class AiAgentServiceImpl implements AiAgentService {
             throw new IllegalStateException("当前未登录");
         }
         return user.getId();
+    }
+
+    private void validateOptionalCoordinates(Double x, Double y) {
+        if ((x == null) != (y == null)
+                || (x != null && (!Double.isFinite(x) || x < -180 || x > 180
+                || !Double.isFinite(y) || y < -90 || y > 90))) {
+            throw new IllegalArgumentException("经纬度必须同时提供且位于有效范围内");
+        }
+    }
+
+    private void validatePromptLength(String prompt) {
+        if (prompt != null && prompt.length() > AiInputLimits.MAX_QUERY_CHARS) {
+            throw new IllegalArgumentException("问题不能超过 " + AiInputLimits.MAX_QUERY_CHARS + " 个字符");
+        }
     }
 
     private String buildAgentLoopReply(AgentLoopExecution execution) {

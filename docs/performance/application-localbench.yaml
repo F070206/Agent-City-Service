@@ -1,0 +1,36 @@
+# 本机压测候选参数，不代表已达到任何性能指标。
+# 不自动加载；加载方法见同目录 local-benchmark-plan.md。
+# 在独立测试数据和服务环境中使用，并保留原配置作为基线。
+server:
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 20
+    max-connections: 2000
+    accept-count: 200
+
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000
+
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+
+logging:
+  level:
+    com.hmdp: warn
+
+ai:
+  agent:
+    bootstrap:
+      enabled: false
+    rag:
+      vector-store-enabled: false
+
+# RedisConfig 会绑定 application.yaml 中显式启用的 Lettuce pool 配置。
+# 此候选文件不覆盖池参数，基线与候选测试保持相同连接池设置。
+# 此文件不改变限流、缓存策略、订单超时、RocketMQ 消费线程或消息语义。

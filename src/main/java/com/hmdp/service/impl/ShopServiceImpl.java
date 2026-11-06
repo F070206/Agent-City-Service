@@ -8,6 +8,7 @@ import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.hmdp.utils.CacheClient;
+import com.hmdp.utils.ShopCacheMetrics;
 import com.hmdp.utils.SystemConstants;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RBloomFilter;
@@ -18,11 +19,16 @@ import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.domain.geo.GeoReference;
 import org.springframework.stereotype.Service;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import jakarta.annotation.Resource;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 import static com.hmdp.utils.RedisConstants.*;
 
@@ -46,29 +52,30 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     private CacheClient cacheClient;
     @Resource
     private RBloomFilter<Long> shopBloomFilter;
+    @Resource
+    private ShopCacheMetrics shopCacheMetrics;
+    private final ConcurrentMap<Long, GeoSyncRequest> pendingGeoSync = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, Boolean> pendingBloomAdds = new ConcurrentHashMap<>();
     @Override
     public Result queryById(Long id) {
-        if (!shopBloomFilter.contains(id)) {
-            log.info("布隆过滤器拦截，店铺ID {} 不存在", id);
-            return Result.fail("店铺不存在");
-        }
-        // 解决缓存穿透
         Shop shop = cacheClient
-                .queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
-
-        // 互斥锁解决缓存击穿
-        // Shop shop = cacheClient
-        //         .queryWithMutex(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
-
-        // 逻辑过期解决缓存击穿
-        // Shop shop = cacheClient
-        //         .queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, 20L, TimeUnit.SECONDS);
+                .queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, this::mayExistInShopBloomFilter,
+                        CACHE_SHOP_TTL, TimeUnit.MINUTES);
 
         if (shop == null) {
             return Result.fail("店铺不存在！");
         }
         // 7.返回
         return Result.ok(shop);
+    }
+
+    private boolean mayExistInShopBloomFilter(Long shopId) {
+        if (shopBloomFilter.contains(shopId)) {
+            return true;
+        }
+        shopCacheMetrics.recordBloomRejection();
+        log.info("布隆过滤器拦截，店铺ID {} 不存在", shopId);
+        return false;
     }
 
     @Override
@@ -78,28 +85,52 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if (id == null) {
             return Result.fail("店铺id不能为空");
         }
-        // 1.更新数据库
-        updateById(shop);
-        // 2.删除缓存
-        stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
+        Shop previous = getById(id);
+        if (previous == null) {
+            return Result.fail("店铺不存在");
+        }
+        if (!updateById(shop)) {
+            return Result.fail("店铺不存在");
+        }
+        refreshShopAfterCommit(id, previous);
         return Result.ok();
     }
 
     @Override
     public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
+        return queryShopByType(typeId, current, x, y, null);
+    }
+
+    @Override
+    public Result queryShopByType(Integer typeId, Integer current, Double x, Double y, String name) {
+        if (typeId == null || current == null || current < 1) {
+            return Result.fail("店铺类型和页码参数无效");
+        }
+        long maxPage = 1000L / SystemConstants.DEFAULT_PAGE_SIZE;
+        if (current > maxPage) {
+            return Result.fail("店铺查询最多支持前1000条");
+        }
+        if ((x == null) != (y == null)
+                || (x != null && (!Double.isFinite(x) || x < -180 || x > 180
+                || !Double.isFinite(y) || y < -90 || y > 90))) {
+            return Result.fail("经纬度参数无效");
+        }
         // 1.判断是否需要根据坐标查询
-        if (x == null || y == null) {
+        if (x == null || y == null || StrUtil.isNotBlank(name)) {
             // 不需要坐标查询，按数据库查询
             Page<Shop> page = query()
                     .eq("type_id", typeId)
+                    .like(StrUtil.isNotBlank(name), "name", name == null ? null : name.trim())
                     .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
             // 返回数据
             return Result.ok(page.getRecords());
         }
 
         // 2.计算分页参数
-        int from = (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
-        int end = current * SystemConstants.DEFAULT_PAGE_SIZE;
+        long fromLong = ((long) current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
+        long endLong = (long) current * SystemConstants.DEFAULT_PAGE_SIZE;
+        int from = (int) fromLong;
+        int end = (int) endLong;
 
         // 3.查询redis、按照距离排序、分页。结果：shopId、distance
         String key = SHOP_GEO_KEY + typeId;
@@ -146,12 +177,110 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Override
     public Result saveShop(Shop shop) {
         // 保存到数据库
-        save(shop);
+        if (!save(shop)) {
+            return Result.fail("保存店铺失败");
+        }
 
-        // 添加到布隆过滤器
-        shopBloomFilter.add(shop.getId());
-        log.info("新店铺 {} 已添加到布隆过滤器", shop.getId());
-
+        // Bloom 是共享 Redis 状态，无法随数据库事务回滚；仅在提交后发布新增 ID。
+        refreshShopAfterCommit(shop.getId(), null, true);
         return Result.ok(shop.getId());
+    }
+
+    private void refreshShopAfterCommit(Long shopId, Shop previous) {
+        refreshShopAfterCommit(shopId, previous, false);
+    }
+
+    private void refreshShopAfterCommit(Long shopId, Shop previous, boolean addToBloom) {
+        Runnable refresh = () -> {
+            if (addToBloom) {
+                addShopToBloom(shopId);
+            }
+            refreshShopCache(shopId);
+            try {
+                refreshShopGeo(shopId, previous);
+                pendingGeoSync.remove(shopId);
+            } catch (RuntimeException geoFailure) {
+                pendingGeoSync.put(shopId, new GeoSyncRequest(shopId,
+                        previous == null ? null : previous.getTypeId()));
+                log.error("店铺数据库已提交，但 GEO 索引同步失败，将重试，shopId={}", shopId, geoFailure);
+            }
+        };
+        if (TransactionSynchronizationManager.isActualTransactionActive()
+                && TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    refresh.run();
+                }
+            });
+        } else {
+            refresh.run();
+        }
+    }
+
+    private void addShopToBloom(Long shopId) {
+        try {
+            shopBloomFilter.add(shopId);
+            pendingBloomAdds.remove(shopId);
+            log.info("新店铺 {} 已添加到布隆过滤器", shopId);
+        } catch (RuntimeException bloomFailure) {
+            pendingBloomAdds.put(shopId, Boolean.TRUE);
+            log.error("店铺已提交，但布隆过滤器更新失败，将重试，shopId={}", shopId, bloomFailure);
+        }
+    }
+
+    @Scheduled(fixedDelayString = "${shop.bloom-sync.retry-ms:5000}")
+    public void retryPendingBloomAdds() {
+        pendingBloomAdds.keySet().forEach(this::addShopToBloom);
+    }
+
+    @Scheduled(fixedDelayString = "${shop.geo-sync.retry-ms:5000}")
+    public void retryPendingGeoSync() {
+        pendingGeoSync.forEach((shopId, request) -> {
+            try {
+                Shop previous = request.previousTypeId() == null ? null
+                        : new Shop().setId(shopId).setTypeId(request.previousTypeId());
+                refreshShopGeo(shopId, previous);
+                pendingGeoSync.remove(shopId, request);
+            } catch (RuntimeException geoFailure) {
+                log.warn("重试店铺 GEO 索引同步失败，shopId={}", shopId, geoFailure);
+            }
+        });
+    }
+
+    private void refreshShopGeo(Long shopId, Shop previous) {
+        Shop latest = getById(shopId);
+        if (previous != null && previous.getTypeId() != null
+                && !Objects.equals(previous.getTypeId(), latest == null ? null : latest.getTypeId())) {
+            stringRedisTemplate.opsForGeo().remove(SHOP_GEO_KEY + previous.getTypeId(), shopId.toString());
+        }
+        if (latest != null && latest.getTypeId() != null && latest.getX() != null && latest.getY() != null) {
+            stringRedisTemplate.opsForGeo().add(SHOP_GEO_KEY + latest.getTypeId(),
+                    new org.springframework.data.geo.Point(latest.getX(), latest.getY()), shopId.toString());
+        } else if (latest != null && latest.getTypeId() != null) {
+            stringRedisTemplate.opsForGeo().remove(SHOP_GEO_KEY + latest.getTypeId(), shopId.toString());
+        }
+    }
+
+    private void refreshShopCache(Long shopId) {
+        String cacheKey = CACHE_SHOP_KEY + shopId;
+        try {
+            Shop latest = getById(shopId);
+            if (latest == null) {
+                stringRedisTemplate.delete(cacheKey);
+            } else {
+                cacheClient.setWithLogicalExpire(cacheKey, latest, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+            }
+        } catch (RuntimeException refreshFailure) {
+            try {
+                stringRedisTemplate.delete(cacheKey);
+            } catch (RuntimeException invalidationFailure) {
+                refreshFailure.addSuppressed(invalidationFailure);
+            }
+            log.error("店铺数据库已提交，但缓存刷新失败；已尝试删除旧缓存，shopId={}", shopId, refreshFailure);
+        }
+    }
+
+    private record GeoSyncRequest(Long shopId, Long previousTypeId) {
     }
 }

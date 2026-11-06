@@ -10,6 +10,7 @@ import com.hmdp.mapper.ShopMapper;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import jakarta.annotation.Resource;
 import java.util.List;
@@ -21,6 +22,7 @@ import java.util.Objects;
         "spring.ai.openai.chat.options.model=test-model",
         "spring.ai.openai.embedding.options.model=test-embedding-model"
 })
+@EnabledIfEnvironmentVariable(named = "CITYAI_RUN_LEGACY_INTEGRATION_TESTS", matches = "true")
 class ShopInsightSeedDataTest {
 
     private static final long TARGET_SHOP_ID = 5L;
@@ -176,7 +178,7 @@ class ShopInsightSeedDataTest {
                 comment.setAnswerId(0L);
                 comment.setContent(commentText);
                 comment.setLiked(0);
-                comment.setStatus(false);
+                comment.setStatus(0);
                 blogCommentsMapper.insert(comment);
                 insertedComments++;
             }

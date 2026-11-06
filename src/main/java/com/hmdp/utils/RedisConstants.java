@@ -15,8 +15,12 @@ public class RedisConstants {
     public static final Long LOCK_SHOP_TTL = 10L;
 
     public static final String SECKILL_STOCK_KEY = "seckill:stock:";
+    public static final String SECKILL_ACTIVITY_KEY = "seckill:activity:";
     public static final String SECKILL_ORDER_PENDING_KEY = "seckill:order:pending:";
     public static final Long SECKILL_ORDER_PENDING_TTL_MINUTES = 5L;
+    public static final String SECKILL_ORDER_DUPLICATE_REFUND_KEY = "seckill:stock:duplicate-rejected:";
+    public static final String SECKILL_DISPATCH_RECOVERY_KEY = "seckill:dispatch:recovery";
+    public static final String SECKILL_DISPATCH_PAYLOAD_KEY = "seckill:dispatch:payload:";
     public static final String BLOG_LIKED_KEY = "blog:liked:";
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";

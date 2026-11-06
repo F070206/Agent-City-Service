@@ -111,18 +111,37 @@ public class PaymentController {
 
     @PostMapping("/callback/wechat/{id}")
     public String wechatPayCallback(@PathVariable("id") Long orderId) {
+        if (!belongsToCurrentUser(orderId)) {
+            return "FAIL";
+        }
         Result result = paymentService.wechatPayCallback(orderId);
         return result.getSuccess() ? "SUCCESS" : "FAIL";
     }
 
     @PostMapping("/callback/alipay/{id}")
     public String alipayCallback(@PathVariable("id") Long orderId) {
+        if (!belongsToCurrentUser(orderId)) {
+            return "fail";
+        }
         Result result = paymentService.alipayCallback(orderId);
         return result.getSuccess() ? "success" : "fail";
     }
 
     @GetMapping("/status/{id}")
     public Result getPaymentStatus(@PathVariable("id") Long orderId) {
+        VoucherOrder order = voucherOrderService.getById(orderId);
+        if (order != null && !belongsToCurrentUser(order)) {
+            return Result.fail("订单不属于当前用户");
+        }
         return paymentService.checkPaymentStatus(orderId);
+    }
+
+    private boolean belongsToCurrentUser(Long orderId) {
+        return belongsToCurrentUser(voucherOrderService.getById(orderId));
+    }
+
+    private boolean belongsToCurrentUser(VoucherOrder order) {
+        return order != null && UserHolder.getUser() != null
+                && UserHolder.getUser().getId().equals(order.getUserId());
     }
 }

@@ -1,0 +1,168 @@
+name: cityai-hub
+
+x-backend: &backend
+  build:
+    context: ..
+    dockerfile: deploy/service.Dockerfile
+  image: cityai-hub-service:local
+  environment: &backend-env
+    JAVA_TOOL_OPTIONS: -Duser.timezone=Asia/Shanghai
+    MYSQL_HOST: ${MYSQL_HOST:-host.docker.internal}
+    MYSQL_PORT: ${MYSQL_PORT:-3306}
+    REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
+    REDIS_PORT: ${REDIS_PORT:-6379}
+    SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:?Set SPRING_DATASOURCE_PASSWORD}
+    SPRING_DATA_REDIS_PASSWORD: ${SPRING_DATA_REDIS_PASSWORD:-}
+    CITYAI_INTERNAL_TOKEN: ${CITYAI_INTERNAL_TOKEN:?Set CITYAI_INTERNAL_TOKEN}
+    NACOS_SERVER_ADDR: nacos:8848
+    CITYAI_HEALTHCHECK_URL: http://127.0.0.1:8086/actuator/health/readiness
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "java -cp '/app/classes:/app/dependency/*' com.hmdp.health.HttpHealthcheck \"$$CITYAI_HEALTHCHECK_URL\""]
+    interval: 10s
+    timeout: 3s
+    retries: 12
+    start_period: 90s
+
+x-orders: &orders
+  <<: *backend
+  depends_on:
+    nacos:
+      condition: service_healthy
+  environment: &orders-env
+    <<: *backend-env
+    CITYAI_ROLE: order
+    SPRING_DATASOURCE_USERNAME: ${ORDER_DB_USERNAME:-${SPRING_DATASOURCE_USERNAME:-root}}
+    SPRING_DATASOURCE_PASSWORD: ${ORDER_DB_PASSWORD:-${SPRING_DATASOURCE_PASSWORD:?Set SPRING_DATASOURCE_PASSWORD}}
+    CITYAI_HEALTHCHECK_URL: http://127.0.0.1:8086/actuator/health/readiness
+    CITYAI_ADMIN_TOKEN: ${CITYAI_ADMIN_TOKEN:-}
+    ROCKETMQ_NAME_SERVER: ${ROCKETMQ_NAME_SERVER:-host.docker.internal:9876}
+    SNOWFLAKE_WORKER_ID: ${SNOWFLAKE_WORKER_ID:-0}
+    SNOWFLAKE_DATACENTER_ID: ${SNOWFLAKE_DATACENTER_ID:-0}
+
+x-gateway: &gateway
+  build:
+    context: ..
+    dockerfile: deploy/gateway.Dockerfile
+  environment: &gateway-env
+    NACOS_SERVER_ADDR: nacos:8848
+    REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
+    REDIS_PORT: ${REDIS_PORT:-6379}
+    SPRING_DATA_REDIS_PASSWORD: ${SPRING_DATA_REDIS_PASSWORD:-}
+    GATEWAY_TRUSTED_PROXIES: ${GATEWAY_TRUSTED_PROXIES:-}
+    GATEWAY_AUTH_RATE: ${GATEWAY_AUTH_RATE:-1}
+    GATEWAY_AUTH_BURST: ${GATEWAY_AUTH_BURST:-5}
+    GATEWAY_USER_RATE: ${GATEWAY_USER_RATE:-10}
+    GATEWAY_USER_BURST: ${GATEWAY_USER_BURST:-20}
+    GATEWAY_CONTENT_RATE: ${GATEWAY_CONTENT_RATE:-50}
+    GATEWAY_CONTENT_BURST: ${GATEWAY_CONTENT_BURST:-100}
+    GATEWAY_ORDER_RATE: ${GATEWAY_ORDER_RATE:-10}
+    GATEWAY_ORDER_BURST: ${GATEWAY_ORDER_BURST:-20}
+    GATEWAY_AI_RATE: ${GATEWAY_AI_RATE:-2}
+    GATEWAY_AI_BURST: ${GATEWAY_AI_BURST:-4}
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  depends_on: &gateway-dependencies
+    nacos:
+      condition: service_healthy
+    user:
+      condition: service_healthy
+    content:
+      condition: service_healthy
+    orders:
+      condition: service_healthy
+    ai:
+      condition: service_healthy
+  healthcheck: &gateway-healthcheck
+    test: ["CMD", "java", "-cp", "/app/healthcheck", "com.hmdp.health.HttpHealthcheck", "http://127.0.0.1:8086/actuator/health/readiness"]
+    interval: 10s
+    timeout: 3s
+    retries: 12
+    start_period: 90s
+  volumes: &gateway-volumes
+    - uploads:/app/uploads:ro
+
+services:
+  nacos:
+    image: nacos/nacos-server:v2.3.2
+    environment:
+      MODE: standalone
+    ports:
+      - "127.0.0.1:8848:8848"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8848/nacos/v1/console/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
+  user:
+    <<: *backend
+    depends_on:
+      nacos:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+      CITYAI_ROLE: user
+      SPRING_DATASOURCE_USERNAME: ${USER_DB_USERNAME:-${SPRING_DATASOURCE_USERNAME:-root}}
+      SPRING_DATASOURCE_PASSWORD: ${USER_DB_PASSWORD:-${SPRING_DATASOURCE_PASSWORD:?Set SPRING_DATASOURCE_PASSWORD}}
+      CITYAI_HEALTHCHECK_URL: http://127.0.0.1:8086/actuator/health/readiness
+  content:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      CITYAI_ROLE: content
+      SPRING_DATASOURCE_USERNAME: ${CONTENT_DB_USERNAME:-${SPRING_DATASOURCE_USERNAME:-root}}
+      SPRING_DATASOURCE_PASSWORD: ${CONTENT_DB_PASSWORD:-${SPRING_DATASOURCE_PASSWORD:?Set SPRING_DATASOURCE_PASSWORD}}
+      CITYAI_HEALTHCHECK_URL: http://127.0.0.1:8086/actuator/health/readiness
+      CITYAI_ADMIN_TOKEN: ${CITYAI_ADMIN_TOKEN:-}
+      SHOP_CACHE_REBUILD_THREADS: ${SHOP_CACHE_REBUILD_THREADS:-10}
+      SHOP_CACHE_REBUILD_QUEUE_CAPACITY: ${SHOP_CACHE_REBUILD_QUEUE_CAPACITY:-1000}
+      SHOP_CACHE_REBUILD_KEEP_ALIVE_SECONDS: ${SHOP_CACHE_REBUILD_KEEP_ALIVE_SECONDS:-60}
+    depends_on:
+      nacos:
+        condition: service_healthy
+      user:
+        condition: service_healthy
+    volumes:
+      - uploads:/data/imgs
+  orders:
+    <<: *orders
+  orders-replica-2:
+    <<: *orders
+    profiles: [order-ha]
+    environment:
+      <<: *orders-env
+      SNOWFLAKE_WORKER_ID: ${ORDERS_REPLICA_2_WORKER_ID:-1}
+  ai:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      CITYAI_ROLE: ai
+      SPRING_DATASOURCE_USERNAME: ${AI_DB_USERNAME:-${SPRING_DATASOURCE_USERNAME:-root}}
+      SPRING_DATASOURCE_PASSWORD: ${AI_DB_PASSWORD:-${SPRING_DATASOURCE_PASSWORD:?Set SPRING_DATASOURCE_PASSWORD}}
+      CITYAI_HEALTHCHECK_URL: http://127.0.0.1:8086/actuator/health/readiness
+      CITYAI_ADMIN_TOKEN: ${CITYAI_ADMIN_TOKEN:-}
+      AI_AGENT_BOOTSTRAP_FAIL_FAST: "true"
+      SPRING_AI_OPENAI_API_KEY: ${SPRING_AI_OPENAI_API_KEY:?Set SPRING_AI_OPENAI_API_KEY}
+      SPRING_AI_MILVUS_HOST: ${SPRING_AI_MILVUS_HOST:-host.docker.internal}
+      SPRING_AI_MILVUS_PORT: ${SPRING_AI_MILVUS_PORT:-19530}
+    depends_on:
+      nacos:
+        condition: service_healthy
+      content:
+        condition: service_healthy
+  gateway:
+    <<: *gateway
+    ports:
+      - "8083:8083"
+  gateway-replica-2:
+    <<: *gateway
+    profiles: [gateway-ha]
+    ports:
+      - "${GATEWAY_REPLICA_2_PORT:-8089}:8083"
+
+volumes:
+  uploads:

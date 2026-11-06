@@ -1,19 +1,30 @@
 package com.hmdp.config;
 
+import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
+import org.springframework.boot.autoconfigure.data.redis.RedisProperties;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration;
 import org.springframework.data.redis.connection.RedisPassword;
 import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
+import org.springframework.data.redis.connection.lettuce.LettucePoolingClientConfiguration;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 import org.springframework.util.StringUtils;
+import io.lettuce.core.api.StatefulConnection;
 
 @Configuration
 public class RedisConfig {
+
+    private final RedisProperties redisProperties;
+
+    public RedisConfig(RedisProperties redisProperties) {
+        this.redisProperties = redisProperties;
+    }
 
     @Value("${spring.data.redis.host:${spring.redis.host:localhost}}")
     private String host;
@@ -37,7 +48,26 @@ public class RedisConfig {
         if (StringUtils.hasText(password)) {
             config.setPassword(RedisPassword.of(password));
         }
-        return new LettuceConnectionFactory(config);
+        return new LettuceConnectionFactory(config, lettuceClientConfiguration());
+    }
+
+    private LettuceClientConfiguration lettuceClientConfiguration() {
+        RedisProperties.Pool pool = redisProperties.getLettuce().getPool();
+        if (!Boolean.TRUE.equals(pool.getEnabled())) {
+            return LettuceClientConfiguration.builder().build();
+        }
+
+        GenericObjectPoolConfig<StatefulConnection<?, ?>> poolConfig = new GenericObjectPoolConfig<>();
+        poolConfig.setMaxTotal(pool.getMaxActive());
+        poolConfig.setMaxIdle(pool.getMaxIdle());
+        poolConfig.setMinIdle(pool.getMinIdle());
+        if (pool.getMaxWait() != null) {
+            poolConfig.setMaxWait(pool.getMaxWait());
+        }
+        if (pool.getTimeBetweenEvictionRuns() != null) {
+            poolConfig.setTimeBetweenEvictionRuns(pool.getTimeBetweenEvictionRuns());
+        }
+        return LettucePoolingClientConfiguration.builder().poolConfig(poolConfig).build();
     }
 
     /**

@@ -21,7 +21,9 @@ function writeJson(key, value) {
 }
 
 function sortOrders(list) {
-  return [...list].sort((left, right) => new Date(right.updateTime || right.createdTime || 0) - new Date(left.updateTime || left.createdTime || 0));
+  return list
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    .sort((left, right) => new Date(right.updateTime || right.createdTime || 0) - new Date(left.updateTime || left.createdTime || 0));
 }
 
 function resolveScopedKey(baseKey, userId) {
@@ -43,7 +45,8 @@ export const useUserStore = defineStore('user', {
     loginDialogVisible: false,
     favoriteShopIds: [],
     orderHistory: [],
-    addressList: []
+    addressList: [],
+    scopedStateVersion: 0
   }),
   getters: {
     isLoggedIn: (state) => Boolean(state.token && state.profile?.id),
@@ -53,16 +56,25 @@ export const useUserStore = defineStore('user', {
   },
   actions: {
     async initAuth() {
-      if (!this.token) {
+      const token = this.token;
+      if (!token) {
         this.resetLocalUserState();
         return;
       }
       try {
-        await this.fetchMe();
+        await this.fetchMe(token);
+        if (this.token !== token) return;
         this.loadUserScopedState();
-        await this.fetchSignCount();
-      } catch {
-        this.clearAuth();
+        await this.fetchSignCount(token);
+      } catch (error) {
+        if (this.token !== token) return;
+        if (error?.response?.status === 401) {
+          this.clearAuth();
+          return;
+        }
+        this.profile = null;
+        this.resetLocalUserState();
+        window.dispatchEvent(new CustomEvent('hm-auth-check-unavailable'));
       }
     },
     setCity(city) {
@@ -75,20 +87,49 @@ export const useUserStore = defineStore('user', {
       this.loginDialogVisible = false;
     },
     async sendCode(phone) {
-      await userApi.sendCode(phone);
+      return userApi.sendCode(phone);
     },
     async login(form) {
       const token = await userApi.login(form);
       this.token = token;
       localStorage.setItem(TOKEN_KEY, token);
+      this.profile = null;
+      this.signCount = 0;
       this.resetLocalUserState();
-      await this.fetchMe();
-      this.loadUserScopedState();
-      await this.fetchSignCount();
-      this.loginDialogVisible = false;
+      try {
+        const profile = await this.fetchMe(token);
+        if (this.token !== token) return;
+        if (!profile) {
+          throw new Error('无法获取登录用户信息，请稍后重试');
+        }
+        this.loadUserScopedState();
+        await this.fetchSignCount(token);
+        if (this.token !== token) return;
+        this.loginDialogVisible = false;
+      } catch (error) {
+        if (this.token !== token) return;
+        try {
+          await userApi.logout();
+          if (this.token === token) this.clearAuth();
+        } catch (logoutError) {
+          if (this.token !== token) return;
+          if (logoutError?.response?.status === 401) {
+            this.clearAuth();
+          } else {
+            // Keep the token when revocation is uncertain so the session can be retried.
+            this.token = token;
+            localStorage.setItem(TOKEN_KEY, token);
+          }
+          this.profile = null;
+          this.signCount = 0;
+          this.resetLocalUserState();
+        }
+        throw error;
+      }
     },
-    async fetchMe() {
+    async fetchMe(expectedToken = this.token) {
       const me = await userApi.getMe();
+      if (this.token !== expectedToken) return null;
       this.profile = me
         ? {
             id: me.id,
@@ -101,21 +142,31 @@ export const useUserStore = defineStore('user', {
       }
       return this.profile;
     },
-    async fetchSignCount() {
-      this.signCount = (await userApi.getSignCount().catch(() => 0)) || 0;
-      return this.signCount;
+    async fetchSignCount(expectedToken = this.token) {
+      const signCount = (await userApi.getSignCount().catch(() => 0)) || 0;
+      if (this.token === expectedToken) this.signCount = signCount;
+      return signCount;
     },
     async signToday() {
+      const token = this.token;
       await userApi.sign();
-      await this.fetchSignCount();
+      await this.fetchSignCount(token);
     },
     getScopedStorageKey(baseKey) {
       return resolveScopedKey(baseKey, this.profile?.id);
     },
     loadUserScopedState() {
-      this.favoriteShopIds = readJson(this.getScopedStorageKey(FAVORITES_KEY), []);
-      this.orderHistory = sortOrders(readJson(this.getScopedStorageKey(ORDERS_KEY), []));
-      this.addressList = readJson(this.getScopedStorageKey(ADDRESSES_KEY), []);
+      const favorites = readJson(this.getScopedStorageKey(FAVORITES_KEY), []);
+      const orders = readJson(this.getScopedStorageKey(ORDERS_KEY), []);
+      const addresses = readJson(this.getScopedStorageKey(ADDRESSES_KEY), []);
+      this.favoriteShopIds = Array.isArray(favorites)
+        ? favorites.map(Number).filter((id) => Number.isFinite(id) && id > 0)
+        : [];
+      this.orderHistory = sortOrders(Array.isArray(orders) ? orders : []);
+      this.addressList = Array.isArray(addresses)
+        ? addresses.filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+        : [];
+      this.scopedStateVersion += 1;
     },
     resetLocalUserState() {
       this.favoriteShopIds = [];
@@ -139,23 +190,35 @@ export const useUserStore = defineStore('user', {
       this.resetLocalUserState();
       localStorage.removeItem(TOKEN_KEY);
     },
-    logout() {
+    async logout() {
+      try {
+        await userApi.logout();
+      } catch (error) {
+        if (error?.response?.status !== 401) {
+          throw error;
+        }
+      }
       this.clearAuth();
     },
     toggleFavorite(shopId) {
       const targetId = Number(shopId);
+      if (!Number.isFinite(targetId) || targetId <= 0) {
+        throw new Error('店铺信息无效，无法更新收藏');
+      }
       if (this.favoriteShopIds.includes(targetId)) {
-        this.favoriteShopIds = this.favoriteShopIds.filter((id) => id !== targetId);
-        this.persistFavorites();
+        const nextFavorites = this.favoriteShopIds.filter((id) => id !== targetId);
+        writeJson(this.getScopedStorageKey(FAVORITES_KEY), nextFavorites);
+        this.favoriteShopIds = nextFavorites;
         return false;
       }
-      this.favoriteShopIds.push(targetId);
-      this.persistFavorites();
+      const nextFavorites = [...this.favoriteShopIds, targetId];
+      writeJson(this.getScopedStorageKey(FAVORITES_KEY), nextFavorites);
+      this.favoriteShopIds = nextFavorites;
       return true;
     },
     clearFavorites() {
+      writeJson(this.getScopedStorageKey(FAVORITES_KEY), []);
       this.favoriteShopIds = [];
-      this.persistFavorites();
     },
     recordOrder(order) {
       const orderId = String(order.orderId);
@@ -164,7 +227,9 @@ export const useUserStore = defineStore('user', {
         updateTime: new Date().toISOString(),
         ...order,
         orderId,
-        status: Number(order.status ?? 1)
+        status: Number(order.status ?? 1),
+        creationPending: order.creationPending ?? false,
+        localOnly: order.localOnly ?? true
       };
       const currentIndex = this.orderHistory.findIndex((item) => String(item.orderId) === orderId);
       if (currentIndex >= 0) {
@@ -196,19 +261,22 @@ export const useUserStore = defineStore('user', {
       this.persistOrders();
     },
     addAddress(address) {
-      this.addressList.unshift({
+      const nextAddress = {
         id: Date.now(),
         city: address.city || this.city,
         contact: address.contact || '默认联系人',
         phone: address.phone || '',
         detail: address.detail || '',
         createdTime: new Date().toISOString()
-      });
-      this.persistAddresses();
+      };
+      const nextAddresses = [nextAddress, ...this.addressList];
+      writeJson(this.getScopedStorageKey(ADDRESSES_KEY), nextAddresses);
+      this.addressList = nextAddresses;
     },
     removeAddress(addressId) {
-      this.addressList = this.addressList.filter((item) => Number(item.id) !== Number(addressId));
-      this.persistAddresses();
+      const nextAddresses = this.addressList.filter((item) => Number(item.id) !== Number(addressId));
+      writeJson(this.getScopedStorageKey(ADDRESSES_KEY), nextAddresses);
+      this.addressList = nextAddresses;
     }
   }
 });

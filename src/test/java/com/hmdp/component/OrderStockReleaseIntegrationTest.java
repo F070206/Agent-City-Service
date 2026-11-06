@@ -21,6 +21,7 @@ class OrderStockReleaseIntegrationTest {
     private StringRedisTemplate redis;
     private List<String> keys;
     private DefaultRedisScript<Long> script;
+    private String orderId;
 
     @BeforeEach
     void setUp() {
@@ -28,16 +29,21 @@ class OrderStockReleaseIntegrationTest {
                 Integer.parseInt(System.getenv().getOrDefault("PAYMENT_TEST_REDIS_PORT", "6379")));
         connection.getStandaloneConfiguration().setPassword(
                 System.getenv().getOrDefault("PAYMENT_TEST_REDIS_PASSWORD", ""));
+        connection.getStandaloneConfiguration().setDatabase(Integer.parseInt(
+                System.getenv().getOrDefault("PAYMENT_TEST_REDIS_DATABASE", "0")));
         connection.afterPropertiesSet();
         redis = new StringRedisTemplate(connection);
         String prefix = "test:payment:" + UUID.randomUUID() + ":";
-        keys = List.of(prefix + "stock", prefix + "users", prefix + "released", prefix + "pending");
+        orderId = UUID.randomUUID().toString();
+        keys = List.of(prefix + "stock", prefix + "users", prefix + "released", prefix + "pending",
+                prefix + "reservations");
         script = new DefaultRedisScript<>();
         script.setLocation(new ClassPathResource("release-order-stock.lua"));
         script.setResultType(Long.class);
         redis.opsForValue().set(keys.get(0), "0");
         redis.opsForSet().add(keys.get(1), "7");
         redis.opsForValue().set(keys.get(3), "7");
+        redis.opsForHash().put(keys.get(4), "7", orderId);
     }
 
     @AfterEach
@@ -62,9 +68,13 @@ class OrderStockReleaseIntegrationTest {
         // 模拟回补成功但数据库 ACK 失败后，用户再次抢购。
         redis.opsForValue().decrement(keys.get(0));
         redis.opsForSet().add(keys.get(1), "7");
+        String newerOrderId = UUID.randomUUID().toString();
+        redis.opsForHash().put(keys.get(4), "7", newerOrderId);
+        redis.delete(keys.get(2)); // 模拟释放标记被 allkeys 淘汰。
         assertEquals(0L, release());
         assertEquals("0", redis.opsForValue().get(keys.get(0)));
         assertTrue(redis.opsForSet().isMember(keys.get(1), "7"));
+        assertEquals(newerOrderId, redis.opsForHash().get(keys.get(4), "7"));
     }
 
     @Test
@@ -103,6 +113,16 @@ class OrderStockReleaseIntegrationTest {
     }
 
     @Test
+    void missingOrderIdentityMappingMustNotReleaseUnknownReservation() {
+        redis.delete(keys.get(4));
+
+        assertEquals(-3L, release());
+        assertEquals("0", redis.opsForValue().get(keys.get(0)));
+        assertTrue(redis.opsForSet().isMember(keys.get(1), "7"));
+        assertFalse(redis.hasKey(keys.get(2)));
+    }
+
+    @Test
     void wrongReservationTypeFailsBeforeChangingStock() {
         redis.delete(keys.get(1));
         redis.opsForValue().set(keys.get(1), "invalid");
@@ -112,6 +132,6 @@ class OrderStockReleaseIntegrationTest {
     }
 
     private Long release() {
-        return redis.execute(script, keys, "7");
+        return redis.execute(script, keys, "7", orderId);
     }
 }

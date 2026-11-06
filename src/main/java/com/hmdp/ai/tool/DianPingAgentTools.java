@@ -6,11 +6,9 @@ import com.hmdp.ai.dto.KnowledgeHitDTO;
 import com.hmdp.ai.dto.ShopReviewSummaryDTO;
 import com.hmdp.ai.dto.ShopToolDTO;
 import com.hmdp.ai.rag.retriever.AiRagRetriever;
-import com.hmdp.dto.Result;
+import com.hmdp.client.ContentCatalog;
 import com.hmdp.entity.Blog;
 import com.hmdp.entity.Shop;
-import com.hmdp.service.IBlogService;
-import com.hmdp.service.IShopService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
@@ -25,9 +23,7 @@ public class DianPingAgentTools {
 
     private static final int REVIEW_SAMPLE_THRESHOLD = 5;
 
-    private final IShopService shopService;
-
-    private final IBlogService blogService;
+    private final ContentCatalog contentCatalog;
 
     private final AiRagRetriever aiRagRetriever;
 
@@ -35,11 +31,7 @@ public class DianPingAgentTools {
 
     @Tool(description = "获取单个店铺详情")
     public ShopToolDTO getShopDetail(@ToolParam(description = "店铺ID") Long shopId) {
-        Result result = shopService.queryById(shopId);
-        if (result == null || result.getData() == null) {
-            return null;
-        }
-        return toShopToolDTO((Shop) result.getData());
+        return toShopToolDTO(contentCatalog.shop(shopId));
     }
 
     @Tool(description = "按分类和坐标搜索附近店铺")
@@ -48,22 +40,22 @@ public class DianPingAgentTools {
             @ToolParam(description = "经度") Double x,
             @ToolParam(description = "纬度") Double y,
             @ToolParam(description = "分页页码") Integer page) {
-        int currentPage = page == null || page < 1 ? 1 : page;
-        Result result = shopService.queryShopByType(typeId, currentPage, x, y);
-        if (result == null || result.getData() == null) {
+        if (typeId == null || typeId < 1 || x == null || y == null
+                || !Double.isFinite(x) || x < -180 || x > 180
+                || !Double.isFinite(y) || y < -90 || y > 90) {
             return List.of();
         }
-        List<Shop> shops = (List<Shop>) result.getData();
+        int currentPage = page == null || page < 1 ? 1 : page;
+        if (currentPage > Math.max(aiAgentProperties.getInsight().getMaxNearbyPage(), 1)) {
+            return List.of();
+        }
+        List<Shop> shops = contentCatalog.nearby(typeId, currentPage, x, y);
         return shops.stream().map(this::toShopToolDTO).toList();
     }
 
     @Tool(description = "按关键词搜索店铺名称、商圈和地址")
     public List<ShopToolDTO> searchShopsByKeyword(@ToolParam(description = "搜索关键词") String keyword) {
-        return shopService.lambdaQuery()
-                .like(Shop::getName, keyword)
-                .or(wrapper -> wrapper.like(Shop::getArea, keyword).or().like(Shop::getAddress, keyword))
-                .last("limit 10")
-                .list()
+        return contentCatalog.search(keyword)
                 .stream()
                 .map(this::toShopToolDTO)
                 .toList();
@@ -76,11 +68,8 @@ public class DianPingAgentTools {
 
     @Tool(description = "获取店铺探店笔记原始文本，优先返回点赞高的样本")
     public List<String> getShopReviewTexts(@ToolParam(description = "店铺ID") Long shopId) {
-        List<Blog> blogs = blogService.lambdaQuery()
-                .eq(Blog::getShopId, shopId)
-                .orderByDesc(Blog::getLiked)
-                .last("limit " + Math.max(aiAgentProperties.getInsight().getMaxReviewSamples(), 1))
-                .list();
+        List<Blog> blogs = contentCatalog.blogsForShop(shopId,
+                Math.max(aiAgentProperties.getInsight().getMaxReviewSamples(), 1));
         if (CollectionUtils.isEmpty(blogs)) {
             return List.of();
         }

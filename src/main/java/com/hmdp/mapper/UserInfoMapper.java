@@ -1,5 +1,7 @@
 package com.hmdp.mapper;
 
+import com.hmdp.micro.MapperRole;
+
 import com.hmdp.entity.UserInfo;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 
@@ -11,6 +13,7 @@ import com.baomidou.mybatisplus.core.mapper.BaseMapper;
  * @author 虎哥
  * @since 2021-12-24
  */
+@MapperRole.User
 public interface UserInfoMapper extends BaseMapper<UserInfo> {
 
 }

@@ -26,6 +26,8 @@ public class AiAgentProperties {
 
     private Mcp mcp = new Mcp();
 
+    private Circuit circuit = new Circuit();
+
     @Data
     public static class Memory {
         private int windowSize = 8;
@@ -33,9 +35,12 @@ public class AiAgentProperties {
 
     @Data
     public static class Rag {
+        private boolean vectorStoreEnabled = true;
         private int topK = 5;
+        private int maxTopK = 20;
         private double similarityThreshold = 0.65;
         private double knowledgeSimilarityThreshold = 0.35;
+        private boolean allowDestructiveCollectionReset = false;
         private Collections collections = new Collections();
     }
 
@@ -49,6 +54,7 @@ public class AiAgentProperties {
 
     @Data
     public static class Insight {
+        private int maxNearbyPage = 20;
         private int maxReviewSamples = 8;
         private int maxReviewCharsPerSample = 280;
         private int maxCombinedChars = 2200;
@@ -84,10 +90,24 @@ public class AiAgentProperties {
     }
 
     @Data
+    public static class Circuit {
+        private boolean enabled = true;
+        private int windowSeconds = 60;
+        private int recoverySeconds = 10;
+        private int minRequests = 5;
+        private double errorRatio = 0.5;
+        private double slowRatio = 0.5;
+        private int modelSlowMillis = 8000;
+        private int streamSlowMillis = 30000;
+        private int toolSlowMillis = 2000;
+    }
+
+    @Data
     public static class McpServer {
         private boolean enabled = false;
         private String baseUrl;
-        private String invokePath = "/tools/invoke";
+        private String transport = "mcp-sse";
+        private String invokePath = "/sse";
         private String apiKey;
         private String toolName;
     }

@@ -20,7 +20,8 @@ class AgentLoopExecutorTest {
         ManualToolAgentLoopExecutor manualToolAgentLoopExecutor = mock(ManualToolAgentLoopExecutor.class);
         AgentLoopExecution execution = new AgentLoopExecution();
         execution.setFinalAnswer("ok");
-        when(manualToolAgentLoopExecutor.execute(any(AgentLoopRequest.class), anyList(), any(AgentLoopObserver.class)))
+        when(manualToolAgentLoopExecutor.execute(any(AgentLoopRequest.class), anyList(),
+                any(AgentLoopObserver.class), any()))
                 .thenReturn(execution);
 
         AgentLoopExecutor executor = new AgentLoopExecutor(manualToolAgentLoopExecutor);
@@ -32,6 +33,7 @@ class AgentLoopExecutorTest {
 
         assertEquals("MULTI_AGENT", result.getScene());
         assertNotNull(result.getAgentLoopExecution());
-        verify(manualToolAgentLoopExecutor).execute(any(AgentLoopRequest.class), anyList(), any(AgentLoopObserver.class));
+        verify(manualToolAgentLoopExecutor).execute(any(AgentLoopRequest.class), anyList(),
+                any(AgentLoopObserver.class), any());
     }
 }
