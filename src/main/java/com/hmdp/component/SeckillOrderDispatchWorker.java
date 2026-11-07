@@ -141,7 +141,8 @@ public class SeckillOrderDispatchWorker {
                 }
                 VoucherOrder order = objectMapper.readValue(payload, VoucherOrder.class);
                 Long orderId = parsedOrderIds.get(orderIdValue);
-                if (!orderId.equals(order.getId()) || order.getUserId() == null || order.getCreateTime() == null) {
+                if (!orderId.equals(order.getId()) || order.getUserId() == null
+                        || order.getVoucherId() == null || order.getCreateTime() == null) {
                     log.error("秒杀恢复消息字段不匹配，保留记录待核对，订单ID={}", orderIdValue);
                     deferRecoveryRecord(orderIdValue);
                     continue;

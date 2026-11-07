@@ -9,6 +9,7 @@ import com.hmdp.entity.Follow;
 import com.hmdp.mapper.FollowMapper;
 import com.hmdp.service.IFollowService;
 import com.hmdp.utils.UserHolder;
+import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -29,6 +30,7 @@ import java.util.stream.Collectors;
  * @since 2021-12-22
  */
 @Service
+@Slf4j
 public class FollowServiceImpl extends ServiceImpl<FollowMapper, Follow> implements IFollowService {
 
     @Resource
@@ -37,6 +39,8 @@ public class FollowServiceImpl extends ServiceImpl<FollowMapper, Follow> impleme
     private UserDirectory userDirectory;
     @Resource
     private RedissonClient redissonClient;
+    @Resource
+    private FollowMapper followMapper;
 
     @Override
     public Result follow(Long followUserId, Boolean isFollow) {
@@ -90,13 +94,24 @@ public class FollowServiceImpl extends ServiceImpl<FollowMapper, Follow> impleme
         String key = "follows:" + userId;
         // 2.求交集
         String key2 = "follows:" + id;
-        Set<String> intersect = stringRedisTemplate.opsForSet().intersect(key, key2);
+        Set<String> intersect;
+        try {
+            intersect = stringRedisTemplate.opsForSet().intersect(key, key2);
+        } catch (RuntimeException redisFailure) {
+            log.warn("Redis 共同关注查询失败，回退数据库，userId={}, otherUserId={}", userId, id, redisFailure);
+            intersect = null;
+        }
+        List<Long> ids;
         if (intersect == null || intersect.isEmpty()) {
-            // 无交集
+            // Redis Set may be cold or lost; the follow table remains the source of truth.
+            ids = followMapper.selectCommonFollowUserIds(userId, id);
+        } else {
+            ids = intersect.stream().map(Long::valueOf).collect(Collectors.toList());
+        }
+        if (ids == null || ids.isEmpty()) {
             return Result.ok(Collections.emptyList());
         }
         // 3.解析id集合
-        List<Long> ids = intersect.stream().map(Long::valueOf).collect(Collectors.toList());
         // 4.查询用户
         List<UserDTO> users = userDirectory.findByIds(ids);
         return Result.ok(users);

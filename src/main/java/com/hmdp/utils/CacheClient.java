@@ -66,6 +66,18 @@ public class CacheClient {
     private static final DefaultRedisScript<Long> RENEW_IF_OWNED = new DefaultRedisScript<>(
             "if redis.call('get', KEYS[1]) == ARGV[1] then "
                     + "return redis.call('expire', KEYS[1], ARGV[2]) end return 0", Long.class);
+    private static final DefaultRedisScript<Long> DELETE_IF_UNCHANGED = new DefaultRedisScript<>(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0",
+            Long.class);
+
+    private static final class InvalidLogicalCacheValueException extends RuntimeException {
+        private final String cachedValue;
+
+        private InvalidLogicalCacheValueException(String key, String cachedValue, RuntimeException cause) {
+            super("Logical cache contains an invalid value: " + key, cause);
+            this.cachedValue = cachedValue;
+        }
+    }
 
     @Autowired
     public CacheClient(StringRedisTemplate stringRedisTemplate, ShopCacheMetrics shopCacheMetrics,
@@ -152,21 +164,38 @@ public class CacheClient {
             Predicate<ID> cacheMissGuard, Long time, TimeUnit unit) {
         String key = keyPrefix + id;
         try {
-            String json = stringRedisTemplate.opsForValue().get(key);
-            if (json == null) {
-                if (!cacheMissGuard.test(id)) {
-                    return null;
+            int invalidValueRetries = 0;
+            while (true) {
+                String json = stringRedisTemplate.opsForValue().get(key);
+                if (json == null) {
+                    if (!cacheMissGuard.test(id)) {
+                        return null;
+                    }
+                    shopCacheMetrics.recordMiss();
+                    return loadLogicalWithMutex(keyPrefix, id, type, dbFallback, time, unit);
                 }
-                shopCacheMetrics.recordMiss();
-                return loadLogicalWithMutex(keyPrefix, id, type, dbFallback, time, unit);
+
+                try {
+                    R result = readLogicalValue(keyPrefix, id, type, dbFallback, time, unit, json);
+                    if (StrUtil.isBlank(json)) {
+                        shopCacheMetrics.recordEmptyHit();
+                    } else {
+                        shopCacheMetrics.recordValueHit();
+                    }
+                    return result;
+                } catch (InvalidLogicalCacheValueException e) {
+                    if (++invalidValueRetries > 3) {
+                        throw new IllegalStateException("Repeated invalid cache replacements: " + key, e);
+                    }
+                    Long deleted = stringRedisTemplate.execute(DELETE_IF_UNCHANGED,
+                            Collections.singletonList(key), e.cachedValue);
+                    if (deleted == null) {
+                        throw new IllegalStateException("Could not invalidate the invalid cache value: " + key, e);
+                    }
+                    shopCacheMetrics.recordError();
+                    log.warn("发现无法解析的店铺缓存，已尝试安全失效并回源: {}", key, e.getCause());
+                }
             }
-            R result = readLogicalValue(keyPrefix, id, type, dbFallback, time, unit, json);
-            if (StrUtil.isBlank(json)) {
-                shopCacheMetrics.recordEmptyHit();
-            } else {
-                shopCacheMetrics.recordValueHit();
-            }
-            return result;
         } catch (RuntimeException e) {
             shopCacheMetrics.recordError();
             throw e;
@@ -179,24 +208,40 @@ public class CacheClient {
         if (StrUtil.isBlank(json)) {
             return null;
         }
-        JSONObject cached = JSONUtil.parseObj(json);
-        // 切换缓存格式期间，旧的普通值继续使用原有物理 TTL。
-        if (!cached.containsKey("expireTime")) {
-            if (cached.containsKey("expireAtEpochMillis")) {
-                throw new IllegalStateException("Logical cache has no compatible expiration field: " + key);
-            }
-            return JSONUtil.toBean(json, type);
-        }
-        RedisData redisData = JSONUtil.toBean(cached, RedisData.class);
-        R r = JSONUtil.toBean((JSONObject) redisData.getData(), type);
-        Long expireAtEpochMillis = redisData.getExpireAtEpochMillis();
+        R r;
         boolean notExpired;
-        if (expireAtEpochMillis != null) {
-            notExpired = expireAtEpochMillis > System.currentTimeMillis();
-        } else {
-            // Older entries used a local wall-clock timestamp; read them until their physical TTL expires.
-            LocalDateTime expireTime = redisData.getExpireTime();
-            notExpired = expireTime != null && expireTime.isAfter(LocalDateTime.now());
+        try {
+            JSONObject cached = JSONUtil.parseObj(json);
+            if (cached == null) {
+                throw new IllegalArgumentException("Cache value is not a JSON object");
+            }
+            // 切换缓存格式期间，旧的普通值继续使用原有物理 TTL。
+            if (!cached.containsKey("expireTime")) {
+                if (cached.containsKey("expireAtEpochMillis")) {
+                    throw new IllegalArgumentException("Logical cache has no compatible expiration field");
+                }
+                r = JSONUtil.toBean(json, type);
+                notExpired = true;
+            } else {
+                RedisData redisData = JSONUtil.toBean(cached, RedisData.class);
+                if (redisData == null || !(redisData.getData() instanceof JSONObject data)) {
+                    throw new IllegalArgumentException("Logical cache payload is missing or invalid");
+                }
+                r = JSONUtil.toBean(data, type);
+                Long expireAtEpochMillis = redisData.getExpireAtEpochMillis();
+                if (expireAtEpochMillis != null) {
+                    notExpired = expireAtEpochMillis > System.currentTimeMillis();
+                } else {
+                    // Older entries used a local wall-clock timestamp; read them until their physical TTL expires.
+                    LocalDateTime expireTime = redisData.getExpireTime();
+                    notExpired = expireTime != null && expireTime.isAfter(LocalDateTime.now());
+                }
+            }
+            if (r == null) {
+                throw new IllegalArgumentException("Cache payload deserialized to null");
+            }
+        } catch (RuntimeException e) {
+            throw new InvalidLogicalCacheValueException(key, json, e);
         }
         if (notExpired) {
             return r;

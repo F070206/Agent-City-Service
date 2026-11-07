@@ -19,6 +19,18 @@ export function orderPageFromResult(result) {
   return result?.status === 'fulfilled' && Array.isArray(result.value) ? result.value : null;
 }
 
+export function orderPayAmount(order) {
+  const localAmount = order?.payAmount;
+  if (isFiniteAmount(localAmount)) return String(localAmount);
+
+  const payValue = order?.payValue;
+  return isFiniteAmount(payValue) ? (Number(payValue) / 100).toFixed(2) : '';
+}
+
+function isFiniteAmount(value) {
+  return value != null && String(value).trim() !== '' && Number.isFinite(Number(value));
+}
+
 export function beginOrderStatusRefresh(activeOrderIds, orderId) {
   const key = String(orderId);
   if (activeOrderIds.has(key)) return null;
@@ -50,7 +62,7 @@ export function mergeOrderPage(localOrders, remoteOrders, append = false) {
       orderId: String(order.orderId),
       shopName: local.shopName || (order.shopId ? `店铺 ${order.shopId}` : ''),
       voucherTitle: order.voucherTitle || local.voucherTitle,
-      payAmount: local.payAmount || (order.payValue == null ? '' : (Number(order.payValue) / 100).toFixed(2)),
+      payAmount: orderPayAmount({ ...order, payAmount: local.payAmount }),
       actualAmount: local.actualAmount || '',
       asyncCreated: local.asyncCreated ?? Number(order.voucherType) === 1,
       creationPending: false,

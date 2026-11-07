@@ -26,6 +26,52 @@ import static org.mockito.Mockito.*;
 class CacheClientTest {
 
     @Test
+    @SuppressWarnings("unchecked")
+    void malformedShopCacheIsInvalidatedAndReloadedFromDatabase() {
+        String key = "cache:shop:77";
+        String malformed = "{bad json";
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
+        ValueOperations<String, String> values = mock(ValueOperations.class);
+        when(redis.opsForValue()).thenReturn(values);
+        when(values.get(key)).thenReturn(malformed, null, null);
+        when(redis.execute(any(), eq(java.util.List.of(key)), eq(malformed))).thenReturn(1L);
+        when(values.setIfAbsent(eq("lock:shop:77"), anyString(), eq(10L), eq(TimeUnit.SECONDS)))
+                .thenReturn(true);
+        when(values.setIfAbsent(eq(key), anyString(), eq(3600L), eq(TimeUnit.SECONDS))).thenReturn(true);
+        Shop shop = new Shop();
+        shop.setId(77L);
+
+        Shop result = new CacheClient(redis, new ShopCacheMetrics(new SimpleMeterRegistry()))
+                .queryWithLogicalExpire("cache:shop:", 77L, Shop.class, id -> shop,
+                        id -> true, 30L, TimeUnit.MINUTES);
+
+        assertEquals(77L, result.getId());
+        verify(redis).execute(any(), eq(java.util.List.of(key)), eq(malformed));
+        verify(values).setIfAbsent(eq(key), anyString(), eq(3600L), eq(TimeUnit.SECONDS));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void malformedShopCacheDoesNotDeleteAConcurrentReplacement() {
+        String key = "cache:shop:78";
+        String malformed = "{bad json";
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
+        ValueOperations<String, String> values = mock(ValueOperations.class);
+        when(redis.opsForValue()).thenReturn(values);
+        when(values.get(key)).thenReturn(malformed, "{\"id\":78}");
+        when(redis.execute(any(), eq(java.util.List.of(key)), eq(malformed))).thenReturn(0L);
+
+        Shop result = new CacheClient(redis, new ShopCacheMetrics(new SimpleMeterRegistry()))
+                .queryWithLogicalExpire("cache:shop:", 78L, Shop.class,
+                        id -> { throw new AssertionError("concurrent replacement must be preserved"); },
+                        id -> true, 30L, TimeUnit.MINUTES);
+
+        assertEquals(78L, result.getId());
+        verify(redis).execute(any(), eq(java.util.List.of(key)), eq(malformed));
+        verify(values, never()).setIfAbsent(eq("lock:shop:78"), anyString(), anyLong(), any());
+    }
+
+    @Test
     void springCreatesCacheClientWithItsInjectedConstructor() {
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
             context.registerBean(StringRedisTemplate.class, () -> mock(StringRedisTemplate.class));

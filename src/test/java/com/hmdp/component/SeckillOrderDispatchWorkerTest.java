@@ -161,6 +161,28 @@ class SeckillOrderDispatchWorkerTest {
     }
 
     @Test
+    void defersRecoveryRecordWhenPayloadHasNoVoucherId() {
+        SeckillOrderDispatchMapper mapper = mock(SeckillOrderDispatchMapper.class);
+        RocketMQTemplate mq = mock(RocketMQTemplate.class);
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
+        ZSetOperations<String, String> zset = mock(ZSetOperations.class);
+        ValueOperations<String, String> values = mock(ValueOperations.class);
+        when(redis.opsForZSet()).thenReturn(zset);
+        when(redis.opsForValue()).thenReturn(values);
+        when(zset.range("seckill:dispatch:recovery", 0, 499)).thenReturn(Set.of("46"));
+        when(mapper.findCompletionStatuses(anyList())).thenReturn(Collections.emptyList());
+        when(values.multiGet(List.of("seckill:dispatch:payload:46")))
+                .thenReturn(List.of("{\"id\":\"46\",\"userId\":7,"
+                        + "\"createTime\":\"2026-11-04T12:00:00\"}"));
+
+        new SeckillOrderDispatchWorker(mapper, mq, redis, objectMapper()).retryPending();
+
+        verify(zset).incrementScore("seckill:dispatch:recovery", "46", 1);
+        verify(mapper, never()).insertRecoveredTasks(anyList());
+        verifyNoInteractions(mq);
+    }
+
+    @Test
     void sendsDueTimeoutMessageFromPersistentTaskAndMarksItSent() {
         SeckillOrderDispatchMapper mapper = mock(SeckillOrderDispatchMapper.class);
         RocketMQTemplate mq = mock(RocketMQTemplate.class);

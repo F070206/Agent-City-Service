@@ -27,4 +27,11 @@ public interface FollowMapper extends BaseMapper<Follow> {
             @Param("afterUserId") Long afterUserId, @Param("afterId") Long afterId,
             @Param("limit") int limit);
 
+    @Select("SELECT DISTINCT mine.follow_user_id FROM tb_follow mine "
+            + "JOIN tb_follow theirs ON theirs.follow_user_id = mine.follow_user_id "
+            + "WHERE mine.user_id = #{userId} AND theirs.user_id = #{otherUserId} "
+            + "ORDER BY mine.follow_user_id")
+    List<Long> selectCommonFollowUserIds(@Param("userId") Long userId,
+            @Param("otherUserId") Long otherUserId);
+
 }

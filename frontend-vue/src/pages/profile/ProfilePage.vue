@@ -281,6 +281,7 @@ import {
   endOrderStatusRefresh,
   hasMoreOrderPages,
   mergeOrderPage,
+  orderPayAmount,
   orderPageFromResult
 } from '@/utils/orders';
 import { canUploadBlogImages, mergeUploadedBlogImages } from '@/utils/blog-image-drafts';
@@ -476,9 +477,7 @@ async function loadMoreOrders() {
 }
 
 function displayOrderAmount(order) {
-  if (order.payAmount) return order.payAmount;
-  if (order.payValue != null) return (Number(order.payValue) / 100).toFixed(2);
-  return '-';
+  return orderPayAmount(order) || '-';
 }
 
 function normalizeBlog(blog) {

@@ -7,6 +7,7 @@ import {
   findLatestOrderForShop,
   hasMoreOrderPages,
   mergeOrderPage,
+  orderPayAmount,
   orderPageFromResult
 } from '../src/utils/orders.js';
 
@@ -28,6 +29,19 @@ test('payment is enabled only for a persisted unpaid order', () => {
     assert.equal(canPayOrder({ status }, true), false);
   }
   assert.equal(canPayOrder(null, true), false);
+});
+
+test('order amounts preserve zero and ignore malformed cached or remote values', () => {
+  assert.equal(orderPayAmount({ payAmount: '0.00', payValue: 500 }), '0.00');
+  assert.equal(orderPayAmount({ payValue: 0 }), '0.00');
+  assert.equal(orderPayAmount({ payAmount: 'invalid', payValue: 1234 }), '12.34');
+  assert.equal(orderPayAmount({ payAmount: '', payValue: 'not-a-number' }), '');
+  assert.equal(orderPayAmount({ payValue: null }), '');
+
+  const merged = mergeOrderPage([
+    { orderId: '1', payAmount: 'NaN', localOnly: false }
+  ], [{ orderId: 1, payValue: 1234 }]);
+  assert.equal(merged[0].payAmount, '12.34');
 });
 
 test('order status refresh locks each order against duplicate requests', () => {

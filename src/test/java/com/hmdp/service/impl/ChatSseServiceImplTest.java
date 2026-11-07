@@ -7,7 +7,10 @@ import com.hmdp.dto.ChatStreamEvent;
 import java.time.LocalDateTime;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -90,5 +93,58 @@ class ChatSseServiceImplTest {
         Set<Object> queuedEvents = (Set<Object>) ReflectionTestUtils.getField(active, "earlySendAttempts");
         assertTrue(queuedEvents.size() > 1);
         verify(redis).convertAndSend(eq(RedisChatSseService.CHANNEL), anyString());
+    }
+
+    @Test
+    void reconnectDuringLastEmitterRemovalKeepsNewConnectionReachable() throws Exception {
+        ChatSseServiceImpl service = new ChatSseServiceImpl();
+        BlockingRemoveEmitterMap emitters = new BlockingRemoveEmitterMap();
+        ReflectionTestUtils.setField(service, "emitters", emitters);
+        SseEmitter first = service.connect(7L, 11L);
+
+        Thread completion = new Thread(() -> {
+            first.complete();
+            service.send(7L, 11L, ChatStreamEvent.builder()
+                    .type("done").conversationId(11L).payload(Map.of("status", "finished"))
+                    .createdTime(LocalDateTime.now()).build());
+        });
+        completion.start();
+        emitters.awaitRemoval();
+        SseEmitter reconnected = service.connect(7L, 11L);
+        emitters.resumeRemoval();
+        completion.join(2_000);
+
+        assertFalse(completion.isAlive(), "Emitter completion should finish");
+        assertTrue(emitters.values().stream().anyMatch(list -> list.contains(reconnected)),
+                "The reconnected stream must remain reachable after the old stream is removed");
+        reconnected.complete();
+    }
+
+    private static final class BlockingRemoveEmitterMap
+            extends ConcurrentHashMap<Object, CopyOnWriteArrayList<SseEmitter>> {
+        private final CountDownLatch removalEntered = new CountDownLatch(1);
+        private final CountDownLatch allowRemoval = new CountDownLatch(1);
+
+        @Override
+        public boolean remove(Object key, Object value) {
+            removalEntered.countDown();
+            try {
+                if (!allowRemoval.await(2, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("Timed out waiting to resume emitter removal");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while pausing emitter removal", e);
+            }
+            return super.remove(key, value);
+        }
+
+        private void awaitRemoval() throws InterruptedException {
+            removalEntered.await(1, TimeUnit.SECONDS);
+        }
+
+        private void resumeRemoval() {
+            allowRemoval.countDown();
+        }
     }
 }

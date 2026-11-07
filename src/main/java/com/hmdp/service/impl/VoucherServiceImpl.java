@@ -96,7 +96,7 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
     public void updateSeckillActivity(Long voucherId, SeckillActivityUpdateRequest request) {
         if (voucherId == null || request == null || request.getStatus() == null
                 || request.getBeginTime() == null || request.getEndTime() == null
-                || request.getBeginTime().isAfter(request.getEndTime())
+                || !request.getBeginTime().isBefore(request.getEndTime())
                 || (request.getStatus() != 0 && request.getStatus() != 1)) {
             throw new IllegalArgumentException("活动状态或起止时间无效");
         }

@@ -1,5 +1,21 @@
 # 项目优化进度与下一步验证
 
+2026-11-07 AI 向量库降级与会话互斥核验：按本地单体与 Compose 微服务配置核对，单体默认允许 Milvus 不可用时使用本地空向量库，Compose 显式 fail-fast；索引 bootstrap 在 Redis 锁内执行，维度不匹配默认不删除既有集合。`CommonConfigurationTest`、`KnowledgeBaseInitializerTest`、`AiVectorIndexPagingTest`、`AiRagRetrieverTest` 共 35 项通过，覆盖降级/失败启动、破坏性重置授权、索引分页和关键词 fallback。再用本机真实 Redis 运行 `RedisConversationExecutionCoordinatorTest`，两个 Redisson 客户端的同会话公平锁互斥测试通过；测试结束后 `lock:ai:conversation:*` 扫描为 0 项。未连接真实 Milvus 或 OpenAI 兼容模型服务，仍需检查线上向量维度、集合与凭据配置。
+
+2026-11-07 Gateway Maven 父工程路径告警：完整构建发现 `gateway/pom.xml` 使用 Maven 默认相对父 POM 路径，先匹配到仓库根目录的单体 POM 并产生父工程错位警告，构建虽成功但可能受未来 Maven 版本影响。添加 `<relativePath/>`，明确从 Maven 坐标解析 Spring Boot parent。Gateway 测试 21 项通过、5 项因未配置真实 Redis 而跳过；修复后再次运行测试成功，parent warning 消失。前端测试 51 项通过、前端生产构建成功；根工程测试 410 项、0 失败/错误、78 项跳过；单体与 Gateway `-DskipTests package` 均成功。`git diff --check` 通过。MySQL/Nacos/Milvus 及 Gateway+Nacos/Redis 端到端联调仍未完成。
+
+2026-11-07 Gateway 真实 Redis 路由联调：使用 Redis 隔离 DB14 运行文档指定的 `GatewayRouteIntegrationTest`，5 项全部通过，验证双内容实例负载均衡、内部路径拒绝、用户/订单/AI 路由、SSE 透传以及两个网关实例共享令牌桶。测试前 DB14 为 0 键，测试后仍为 0 键；临时 Gateway 和后端服务正常关闭。测试关闭 Nacos 且后端为本地模拟服务，不替代 Nacos 服务发现及完整业务容器联调。
+
+2026-11-07 Compose 微服务启动配置复核：分别展开默认配置与 `order-ha`/`gateway-ha` profile，核对默认 6 个服务、用户→内容→AI 依赖健康门控、Gateway 对四类服务的启动依赖、限流变量传递、订单副本 worker ID=1、Gateway 副本 8089 映射及两个 Gateway 共享 Redis，8 项断言全部通过。Docker Engine 当前未运行（Linux Engine named pipe 不存在），因此未执行容器启动、健康检查或 Nacos 注册发现联调；未修改 Compose 业务配置。
+
+2026-11-07 秒杀活动零时长窗口拒绝：确认活动更新只拒绝开始晚于结束，允许两者相等；Redis Lua 使用 `now < beginTime` 与 `now >= endTime`，因此该活动永远不会受理却会报告更新成功。新增测试在旧逻辑下观察到服务访问了数据库而未及早拒绝；现要求结束时间严格晚于开始时间。`VoucherServiceActivityTest`、`VoucherServiceCreateTest`、`VoucherControllerAdminTest` 共 12 项全部通过；`git diff --check` 通过。未连接真实 MySQL/Redis 验证事务提交后的活动缓存刷新。
+
+2026-11-07 共同关注 Redis 冷数据回退：确认 `followCommons` 只依赖 `follows:<userId>` 的 Redis SINTER；Redis 冷启动/数据清理时，即使 `tb_follow` 中仍有共同关注关系，也会静默返回空列表。新增 MySQL 共同关注 ID 查询，在 Redis 交集为空或 Redis 访问异常时回查关系表，再通过现有 UserDirectory 组装用户信息，保留缓存命中时的原路径。回归测试先在旧逻辑下失败；修复后 FollowServiceIdempotencyTest、BlogServiceImplTest、BlogLikeLockTest、BlogFeedDispatchWorkerTest 共 17 项通过，0 失败/错误/跳过；`git diff --check` 通过。SQL 尚未在真实 MySQL 环境执行。
+
+2026-11-07 RAG 向量索引与回退核验：按索引重建链路检查源数据分页暂存、替换失败清理、Milvus 多实例初始化锁、平台知识关键词 fallback 与检索熔断；相关实现与文档行为一致，未发现新的可复现缺陷，因此未改业务代码。`AiVectorIndexPagingTest`、`AiRagRetrieverTest`、`KnowledgeBaseInitializerTest`、`AiDependencyGuardTest`、`AiDependencyCircuitRulesTest` 共 34 项全部通过；`git diff --check` 通过。未连接真实 Milvus 或模型服务验证线上集合与嵌入兼容性。
+
+2026-11-07 SSE 重连与最后连接清理竞态：按 AI 流式链路复核本地 emitter 生命周期，新增受控并发回归测试并在原实现上复现：最后一个连接从列表移除后、会话映射删除前若新连接复用同一列表，新连接也会随旧映射一起丢失。现连接注册和移除都在 ConcurrentHashMap 对应键的原子计算中更新，避免重连落入被删除的列表。`ChatSseServiceImplTest`、任务恢复/租约/完成及流式熔断相关测试共 16 项，0 失败/错误、1 项因 Redis 测试环境未配置而跳过；`git diff --check` 通过。未做真实 Redis Pub/Sub 或浏览器断流联调。
+
 2026-11-06 逻辑过期缓存锁异常时保留可用旧值：对照项目缓存治理要求检查 `CacheClient.readLogicalValue`，新增回归模拟 Redis 缓存读取成功、过期值可反序列化但随后 `SET NX` 获取重建锁抛错；旧逻辑把请求失败，未利用已读到的逻辑过期数据。现在仅锁获取异常路径记录错误指标和告警并返回该旧值，不执行同步回源；下一请求仍可尝试刷新。`CacheClientTest` 15 项、`ShopCacheTest` 9 项、`ShopCacheRebuildExecutorTest` 2 项通过，0 失败/错误/跳过；`git diff --check` 通过。未使用真实 Redis 故障注入。
 
 2026-11-06 订单支付/关单竞态离线复核：复查支付创建和回调的未支付条件更新、秒杀 15 分钟截止条件，以及关单事务内订单状态、数据库库存回补和库存同步任务写入；当前未发现新的确定性缺陷。离线运行 `PaymentServiceImplTest` 10 项、`OrderTimeoutRecoveryWorkerTest` 6 项、`OrderStockSyncWorkerTest` 7 项，全部通过。`PaymentConsistencyIntegrationTest` 31 项因本机未设置 `PAYMENT_TEST_MYSQL_HOST` 全部跳过，真实 MySQL 的支付/关单竞争本轮未验证；`git diff --check` 通过。
@@ -518,3 +534,14 @@ pm run build 通过（Sass legacy JS API 弃用提示），git diff --check 通�
 2026-11-06 数值状态字段映射复核：继续扫描实体与 DDL 时发现 `tb_blog_comments.status` 同样是 0/1/2 状态，却映射成 Boolean；改为 Integer，并将种子测试的正常状态改为 0。新增统一序列化测试覆盖会员等级 3 和评论状态 2；`EntityNumericStateTest` 2 项通过，Maven 测试编译通过。
 
 2026-11-06 NULL 点赞计数处理：核对 `tb_blog.liked` 后发现字段允许 NULL，而点赞/取消点赞使用普通加减，NULL 会一直保持 NULL，用户操作成功但热度计数不变。点赞现用 COALESCE 从 0 递增，取消点赞对 NULL/0 保持 0，避免无效负数；扩展锁测试检查两条生成的 SQL 并验证两次操作均在锁内。BlogLikeLockTest 定向通过，git diff --check 通过。
+
+2026-11-07 订单金额异常值显示修正：核对后端 payValue 以分为单位、本地订单 payAmount 以元保存后，确认缓存中的空白/非数字金额会在个人中心显示为 NaN，远端异常金额也会污染合并订单。新增统一金额解析：有效本地金额优先，远端分值仅在数值有效时转元，异常值回退为空并在个人中心显示 -；零金额保持正常。新增订单金额边界回归测试；前端全量测试 51 项通过，生产构建成功（仅 Sass legacy JS API 弃用提示），git diff --check 通过。未连接真实订单服务做端到端验证。
+
+2026-11-07 秒杀恢复 payload 必填字段校验：沿 Redis 恢复队列到 MySQL outbox 核对发现，worker 检查订单 ID、用户 ID 和创建时间，却漏检订单表非空的 voucher ID。新增缺少券 ID 的回归测试先复现：残缺 payload 被写入 outbox，后续会持续重投失败；现加入必填校验，缺字段时保留 Redis 恢复记录并延后核对，不写入毒性 outbox。投递 worker、超时补扫、库存同步及相关指标定向测试共 28 项通过，git diff --check 通过。真实 MySQL/Redis 集成测试因测试连接配置未提供而未运行。
+
+2026-11-07 店铺缓存损坏值回源：确认逻辑缓存遇到不可解析 JSON 会直接抛异常，查询未尝试数据库回源，损坏值会使店铺请求持续失败至自然过期。新增测试先复现解析异常；现将格式错误或结构无效的数据标记为坏缓存，使用 Redis Lua 比较原值后删除，避免覆盖并发写入的新缓存，再沿原 Bloom 检查与互斥回源流程重建。缓存、店铺缓存及重建线程池定向测试通过，覆盖成功回源和并发替换不被误删；git diff --check 通过。真实 Redis 并发测试未运行。
+2026-11-07 微服务新库 DDL 与 Mapper 静态核对：对照 `micro-user.sql`、`micro-content.sql`、`micro-order.sql`、`micro-ai.sql` 与实体注解、Mapper SQL 和微服务部署文档中的库表归属。四个库中的业务表及补偿表都能在当前实体/Mapper 调用中找到对应，映射所需字段也存在；未确认到 DDL 缺表或缺列问题，因此未改业务代码。PowerShell 静态提取核对通过，`git diff --check` 通过。当前 MySQL 凭据不可用，未执行真实初始化或集成联调；Docker Engine、Nacos、Milvus 和模型服务仍未就绪。
+
+2026-11-07 原有 MySQL 账号真实数据库验证：读取已存在的本地配置，通过 root 连接本机 MySQL 8.0，确认具备独立临时库权限。运行 PaymentConsistencyIntegrationTest 与 AiTaskConsistencyIntegrationTest：支付一致性 31 项中 25 项通过、6 项因未配置 Redis/MQ 联合环境跳过；AI 任务 11 项全部通过，未调用模型 API。测试退出后检查 payment_consistency_test_% 与 ai_task_test_% 临时库，均无残留。尚未验证需 Docker/Nacos/Milvus/模型服务的完整微服务链路。
+
+2026-11-07 主 Redis 联合验证：按用户授权，使用现有 Redis 与原有 MySQL 账号运行 PaymentConsistencyIntegrationTest。31 项中 28 项通过、3 项仅因 RocketMQ NameServer 未运行而跳过，0 失败/错误；测试后未发现 payment_consistency_test_% 临时库残留。Redis 用例使用随机业务键并由测试清理。MQ 安装目录存在但 9876 端口未监听，尚未验证 MQ 联合用例。

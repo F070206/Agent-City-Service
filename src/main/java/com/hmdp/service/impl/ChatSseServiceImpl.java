@@ -33,7 +33,12 @@ public class ChatSseServiceImpl implements ChatSseService {
         StreamKey key = new StreamKey(userId, conversationId);
         SseEmitter emitter = new SseEmitter(SSE_TIMEOUT_MILLIS);
         registerUserEmitter(userId, emitter);
-        emitters.computeIfAbsent(key, ignored -> new CopyOnWriteArrayList<>()).add(emitter);
+        emitters.compute(key, (ignored, emitterList) -> {
+            CopyOnWriteArrayList<SseEmitter> current = emitterList == null
+                    ? new CopyOnWriteArrayList<>() : emitterList;
+            current.add(emitter);
+            return current;
+        });
         emitter.onCompletion(() -> removeEmitter(key, emitter));
         emitter.onTimeout(() -> removeEmitter(key, emitter));
         emitter.onError(ex -> removeEmitter(key, emitter));
@@ -66,17 +71,15 @@ public class ChatSseServiceImpl implements ChatSseService {
     }
 
     private void removeEmitter(StreamKey key, SseEmitter emitter) {
-        CopyOnWriteArrayList<SseEmitter> emitterList = emitters.get(key);
-        boolean removed = emitterList != null && emitterList.remove(emitter);
-        if (emitterList != null && emitterList.isEmpty()) {
-            emitters.remove(key, emitterList);
-        }
-        if (removed) {
-            userEmitters.computeIfPresent(key.userId(), (userId, connections) -> {
-                connections.remove(emitter);
-                return connections.isEmpty() ? null : connections;
-            });
-        }
+        emitters.computeIfPresent(key, (ignored, emitterList) -> {
+            if (emitterList.remove(emitter)) {
+                userEmitters.computeIfPresent(key.userId(), (userId, connections) -> {
+                    connections.remove(emitter);
+                    return connections.isEmpty() ? null : connections;
+                });
+            }
+            return emitterList.isEmpty() ? null : emitterList;
+        });
     }
 
     private void registerUserEmitter(Long userId, SseEmitter emitter) {

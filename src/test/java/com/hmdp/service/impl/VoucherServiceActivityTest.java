@@ -83,6 +83,18 @@ class VoucherServiceActivityTest {
     }
 
     @Test
+    void rejectsEmptyActivityWindowBeforeDatabaseAccess() {
+        VoucherServiceImpl service = spy(new VoucherServiceImpl());
+        SeckillVoucherMapper mapper = mock(SeckillVoucherMapper.class);
+        ReflectionTestUtils.setField(service, "seckillVoucherMapper", mapper);
+        SeckillActivityUpdateRequest request = request();
+        request.setEndTime(request.getBeginTime());
+
+        assertThrows(IllegalArgumentException.class, () -> service.updateSeckillActivity(9L, request));
+        verifyNoInteractions(mapper);
+    }
+
+    @Test
     @SuppressWarnings("unchecked")
     void publishesNewSeckillStockAndActivityOnlyAfterDatabaseCommit() {
         VoucherServiceImpl service = spy(new VoucherServiceImpl());
